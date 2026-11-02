@@ -650,7 +650,7 @@ struct sprdwl_cmd_11v {
 	u16 len;
 	union {
 		u32 value;
-		u8 buf[];
+		DECLARE_FLEX_ARRAY(u8, buf);
 	};
 } __packed;
 
