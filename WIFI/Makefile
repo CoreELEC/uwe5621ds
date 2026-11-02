@@ -5,7 +5,9 @@ all_dependencies := driver
 ifneq ($(UNISOC_BSP_INCLUDE),)
 ccflags-y += -I$(UNISOC_BSP_INCLUDE)
 endif
-ccflags-y += -I$(KERNEL_SRC)/$(M)/../BSP/include/
+# $(src) is the directory of this Makefile; $(KERNEL_SRC)/$(M)/.. does not
+# exist when M is an absolute path (e.g. CoreELEC: M=${PKG_BUILD})
+ccflags-y += -I$(src)/../BSP/include/
 ifneq ($(UNISOC_WIFI_CUS_CONFIG),)
 ccflags-y += -DCUSTOMIZE_WIFI_CFG_PATH=\"$(UNISOC_WIFI_CUS_CONFIG)\"
 endif
