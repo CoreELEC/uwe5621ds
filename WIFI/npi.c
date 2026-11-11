@@ -129,11 +129,21 @@ static int sprdwl_npi_pre_doit(struct genl_ops *ops,
 	}
 
 	if (info->attrs[SPRDWL_NL_ATTR_IFINDEX]) {
+		if (nla_len(info->attrs[SPRDWL_NL_ATTR_IFINDEX]) < sizeof(u32))
+			return -EINVAL;
 		ifindex = nla_get_u32(info->attrs[SPRDWL_NL_ATTR_IFINDEX]);
 		ndev = dev_get_by_index(genl_info_net(info), ifindex);
 		if (!ndev) {
 			wl_err("NPI: Could not find ndev\n");
 			return -EFAULT;
+		}
+		/*
+		 * Any ifindex can be passed in: netdev_priv() of a device that
+		 * is not ours is not a struct sprdwl_vif.
+		 */
+		if (!sprdwl_is_sprdwl_netdev(ndev)) {
+			dev_put(ndev);
+			return -ENODEV;
 		}
 		vif = netdev_priv(ndev);
 		priv = vif->priv;
@@ -206,6 +216,11 @@ static int sprdwl_nl_npi_handler(struct sk_buff *skb_2, struct genl_info *info)
 
 	s_buf = nla_data(info->attrs[SPRDWL_NL_ATTR_AP2CP]);
 	s_len = nla_len(info->attrs[SPRDWL_NL_ATTR_AP2CP]);
+	/* the command header is parsed below; keep the old 1024 byte limit */
+	if (s_len < sizeof(*hdr) || s_len > 1024) {
+		kfree(r_buf);
+		return -EINVAL;
+	}
 	if (sprdwl_npi_cmd_is_start(s_buf) && sta_or_p2p_is_opened()) {
 		hdr = kzalloc(sizeof(*hdr), GFP_KERNEL);
 		if (!hdr) {
@@ -273,8 +288,8 @@ static int sprdwl_nl_get_info_handler(struct sk_buff *skb_2,
 	int ret = 0;
 
 	if (vif) {
+		/* no vif reference was taken here, so none is dropped */
 		ether_addr_copy(r_buf, vif->ndev->dev_addr);
-		sprdwl_put_vif(vif);
 		r_len = 6;
 		ret = sprdwl_nl_send_generic(info, SPRDWL_NL_ATTR_CP2AP,
 					     SPRDWL_NL_CMD_GET_INFO, r_len,
@@ -294,12 +309,17 @@ static struct nla_policy sprdwl_genl_policy[SPRDWL_NL_ATTR_MAX + 1] = {
 #endif
 
 static struct genl_ops sprdwl_nl_ops[] = {
+	/*
+	 * NPI commands drive the RF test interface of the firmware: they
+	 * must not be available to unprivileged users.
+	 */
 	{
 		.cmd = SPRDWL_NL_CMD_NPI,
 #if KERNEL_VERSION(5, 2, 0) > LINUX_VERSION_CODE
 		.policy = sprdwl_genl_policy,
 #endif
 		.doit = sprdwl_nl_npi_handler,
+		.flags = GENL_ADMIN_PERM,
 	},
 	{
 		.cmd = SPRDWL_NL_CMD_GET_INFO,
@@ -307,6 +327,7 @@ static struct genl_ops sprdwl_nl_ops[] = {
 		.policy = sprdwl_genl_policy,
 #endif
 		.doit = sprdwl_nl_get_info_handler,
+		.flags = GENL_ADMIN_PERM,
 	}
 };
 

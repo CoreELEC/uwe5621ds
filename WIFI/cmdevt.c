@@ -372,14 +372,26 @@ static void sprdwl_cmd_unlock(struct sprdwl_cmd *cmd)
 }
 
 struct sprdwl_msg_buf *__sprdwl_cmd_getbuf(struct sprdwl_priv *priv,
-					   u16 len, u8 ctx_id,
+					   unsigned int len, u8 ctx_id,
 					   enum sprdwl_head_rsp rsp,
 					   u8 cmd_id, gfp_t flags)
 {
 	struct sprdwl_msg_buf *msg;
 	struct sprdwl_cmd_hdr *hdr;
-	u16 plen = sizeof(*hdr) + len;
+	u16 plen;
 	enum sprdwl_mode mode = SPRDWL_MODE_NONE;/*default to open new device*/
+
+	/*
+	 * plen is the 16-bit on-wire length. Callers pass lengths derived
+	 * from user space (nl80211 attributes, ioctls): reject anything
+	 * that would wrap, since the caller then copies @len bytes into a
+	 * buffer sized from the truncated value.
+	 */
+	if (len > U16_MAX - sizeof(*hdr)) {
+		wl_err("%s cmd %d len %u too long\n", __func__, cmd_id, len);
+		return NULL;
+	}
+	plen = sizeof(*hdr) + len;
 #if defined(UWE5621_FTR)
 	void *data = NULL;
 	struct sprdwl_vif *vif;
@@ -2695,7 +2707,7 @@ unsigned short sprdwl_rx_rsp_process(struct sprdwl_priv *priv, u8 *msg)
 	if (hdr->common.ctx_id >= STAP_MODE_COEXI_NUM ||
 #endif
 		hdr->cmd_id > WIFI_CMD_MAX ||
-	    plen > 2048) {
+	    plen > 2048 || plen < sizeof(*hdr)) {
 		wl_err("%s wrong CMD_RSP: ctx_id:%d;cmd_id:%d\n",
 		       __func__, hdr->common.ctx_id,
 		       hdr->cmd_id);
@@ -2829,12 +2841,15 @@ void sprdwl_event_connect(struct sprdwl_vif *vif, u8 *data, u16 len)
 
 	/*init data struct*/
 	memset(&conn_info, 0, sizeof(conn_info));
+	if (left < (int)sizeof(conn_info.status))
+		goto out;
 	/* the first byte is status code */
 	memcpy(&conn_info.status, pos, sizeof(conn_info.status));
 	if (conn_info.status != SPRDWL_CONNECT_SUCCESS &&
 	    conn_info.status != SPRDWL_ROAM_SUCCESS){
 		/*Assoc response status code by set in the 3 byte if failure*/
-		memcpy(&status_code, pos+2, sizeof(status_code));
+		if (left >= 3)
+			memcpy(&status_code, pos+2, sizeof(status_code));
 		goto out;
 	}
 	pos += sizeof(conn_info.status);
@@ -2861,32 +2876,52 @@ void sprdwl_event_connect(struct sprdwl_vif *vif, u8 *data, u16 len)
 	pos += sizeof(conn_info.signal);
 	left -= sizeof(conn_info.signal);
 
+	/*
+	 * Each IE block is a 16-bit length followed by that many bytes.
+	 * Validate both against what is left of the event before using
+	 * them: the lengths used to be trusted, so a short or corrupted
+	 * event made cfg80211 copy IEs from beyond the event buffer.
+	 * On a truncated block its length is reset to 0, which
+	 * sprdwl_report_connection() handles as "IE missing".
+	 */
 	/* parse REQ IE */
-	if (left < 0)
+	if (left < (int)sizeof(conn_info.req_ie_len))
 		goto out;
 	memcpy(&conn_info.req_ie_len, pos, sizeof(conn_info.req_ie_len));
 	pos += sizeof(conn_info.req_ie_len);
 	left -= sizeof(conn_info.req_ie_len);
+	if (conn_info.req_ie_len > left) {
+		conn_info.req_ie_len = 0;
+		goto out;
+	}
 	conn_info.req_ie = pos;
 	pos += conn_info.req_ie_len;
 	left -= conn_info.req_ie_len;
 
 	/* parse RESP IE */
-	if (left < 0)
+	if (left < (int)sizeof(conn_info.resp_ie_len))
 		goto out;
 	memcpy(&conn_info.resp_ie_len, pos, sizeof(conn_info.resp_ie_len));
 	pos += sizeof(conn_info.resp_ie_len);
 	left -= sizeof(conn_info.resp_ie_len);
+	if (conn_info.resp_ie_len > left) {
+		conn_info.resp_ie_len = 0;
+		goto out;
+	}
 	conn_info.resp_ie = pos;
 	pos += conn_info.resp_ie_len;
 	left -= conn_info.resp_ie_len;
 
 	/* parse BEA IE */
-	if (left < 0)
+	if (left < (int)sizeof(conn_info.bea_ie_len))
 		goto out;
 	memcpy(&conn_info.bea_ie_len, pos, sizeof(conn_info.bea_ie_len));
 	pos += sizeof(conn_info.bea_ie_len);
 	left -= sizeof(conn_info.bea_ie_len);
+	if (conn_info.bea_ie_len > left) {
+		conn_info.bea_ie_len = 0;
+		goto out;
+	}
 	conn_info.bea_ie = pos;
 out:
 	sprdwl_report_connection(vif, &conn_info, status_code);
@@ -2945,12 +2980,20 @@ void sprdwl_event_frame(struct sprdwl_vif *vif, u8 *data, u16 len, int flag)
 			(data - sizeof(*frame) + len);
 		buf = data - sizeof(*frame);
 	} else {
+		if (len < sizeof(*frame))
+			return;
 		frame = (struct sprdwl_event_mgmt_frame *)data;
 		buf = frame->data;
 	}
 	channel = frame->channel;
 	type = frame->type;
 	buf_len = SPRDWL_GET_LE16(frame->len);
+	/* the frame must lie within the event payload */
+	if (!flag && buf_len > len - sizeof(*frame)) {
+		wl_ndev_log(L_ERR, vif->ndev, "%s invalid frame len %u > %zu\n",
+			    __func__, buf_len, len - sizeof(*frame));
+		return;
+	}
 
 	sprdwl_cfg80211_dump_frame_prot_info(0, 0, buf, buf_len);
 
@@ -2991,7 +3034,11 @@ void sprdwl_event_epno_results(struct sprdwl_vif *vif, u8 *data, u16 data_len)
 			     16, 1, data, data_len, true);
 
 	epno_results = (struct sprdwl_epno_results *)data;
-	if (epno_results->nr_scan_results <= 0) {
+	if (data_len < sizeof(*epno_results) ||
+	    epno_results->nr_scan_results <= 0 ||
+	    data_len < sizeof(*epno_results) +
+		       epno_results->nr_scan_results *
+		       sizeof(struct sprdwl_gscan_result)) {
 		wl_err("%s invalid data\n", __func__);
 		return;
 	}
@@ -3049,6 +3096,9 @@ void sprdwl_event_epno_results(struct sprdwl_vif *vif, u8 *data, u16 data_len)
 			    epno_results->results[i].beacon_period);
 		nla_put_u16(skb, GSCAN_RESULTS_SCAN_RESULT_CAPABILITY,
 			    epno_results->results[i].capability);
+		/* firmware data: make sure the SSID string is terminated */
+		epno_results->results[i].ssid[
+			sizeof(epno_results->results[i].ssid) - 1] = '\0';
 		nla_put_string(skb, GSCAN_RESULTS_SCAN_RESULT_SSID,
 			       epno_results->results[i].ssid);
 
@@ -3076,6 +3126,8 @@ void sprdwl_event_gscan_frame(struct sprdwl_vif *vif, u8 *data, u16 len)
 	u16 buf_len;
 	u8 bucket_id = 0;
 
+	if (len < sizeof(u32))
+		return;
 	report_event = *(u32 *)pos;
 	avail_len -= sizeof(u32);
 	pos += sizeof(u32);
@@ -3092,7 +3144,9 @@ void sprdwl_event_gscan_frame(struct sprdwl_vif *vif, u8 *data, u16 len)
 	}
 
 	while (avail_len > 0) {
-		if (avail_len < sizeof(struct sprdwl_gscan_result)) {
+		/* each entry: bucket id byte + result header + IEs */
+		if (avail_len < (s32)(sizeof(u8) +
+				      sizeof(struct sprdwl_gscan_result))) {
 			wl_ndev_log(L_ERR, vif->ndev,
 				   "%s invalid available length: %d!\n",
 				   __func__, avail_len);
@@ -3100,10 +3154,18 @@ void sprdwl_event_gscan_frame(struct sprdwl_vif *vif, u8 *data, u16 len)
 		}
 
 		bucket_id = *(u8 *)pos;
-		pos += sizeof(u8);
-		frame = (struct sprdwl_gscan_result *)pos;
-		frame->ts = jiffies;
+		frame = (struct sprdwl_gscan_result *)(pos + sizeof(u8));
 		buf_len = frame->ie_length;
+		if (avail_len < (s32)(sizeof(u8) +
+				      sizeof(struct sprdwl_gscan_result) +
+				      buf_len)) {
+			wl_ndev_log(L_ERR, vif->ndev,
+				   "%s invalid ie length: %u, avail: %d!\n",
+				   __func__, buf_len, avail_len);
+			break;
+		}
+		pos += sizeof(u8);
+		frame->ts = jiffies;
 
 		if ((report_event == REPORT_EVENTS_BUFFER_FULL) ||
 			(report_event & REPORT_EVENTS_EACH_SCAN))
@@ -3530,6 +3592,13 @@ unsigned short sprdwl_rx_event_process(struct sprdwl_priv *priv, u8 *msg)
 		       __func__, le32_to_cpu(hdr->mstime), ctx_id,
 		       evt2str(hdr->cmd_id), hdr->plen);
 		return plen;
+	}
+
+	/* "len = plen - sizeof(*hdr)" below must not wrap */
+	if (plen < sizeof(*hdr)) {
+		wl_err("%s invalid event len %u for [%s]\n", __func__, plen,
+		       evt2str(hdr->cmd_id));
+		return 0;
 	}
 
 	wl_debug("[%u]ctx_id %d recv[%s]len: %d\n",

@@ -1543,6 +1543,11 @@ void sprdwl_event_sta_lut(struct sprdwl_vif *vif, u8 *data, u16 len)
 	}
 
 	i = sta_lut->sta_lut_index;
+	/* firmware supplied index into peer_entry[] / tx_num[] */
+	if (i >= MAX_LUT_NUM) {
+		wl_err("%s, invalid lut index %d\n", __func__, i);
+		return;
+	}
 
 	wl_debug("ctx_id:%d,action:%d,lut:%d\n", sta_lut->ctx_id,
 		sta_lut->action, sta_lut->sta_lut_index);

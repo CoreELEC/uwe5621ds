@@ -454,6 +454,15 @@ static void mm_normal_data_process(struct sprdwl_mm *mm_entry,
 		wl_err("%s: data len is %d, too short\n",
 		       __func__, len);
 		free_data = true;
+	} else if (unlikely(msdu_total_len(msdu_desc) > len)) {
+		/*
+		 * @len is the payload length after the hif header: an MSDU
+		 * claiming more than that would make the copy below read
+		 * past the receive buffer.
+		 */
+		wl_err("%s: msdu len %d > data len %d\n",
+		       __func__, msdu_total_len(msdu_desc), len);
+		free_data = true;
 	} else {
 		csum = get_sdio_data_csum((void *)rx_if->intf, data);
 		skb_len = SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) +

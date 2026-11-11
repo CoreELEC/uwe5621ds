@@ -170,7 +170,14 @@ static int sdiohal_rx_buf_parser(char *data_buf, int valid_len)
 				sdiohal_err("%s skip type[%d]sub[%d]len[%d]\n",
 					    __func__, puh->type, puh->subtype,
 					    puh->len);
-				continue;
+				/*
+				 * "continue" re-parsed the same header without
+				 * advancing: with len == 0 that spun forever in
+				 * the RX thread, and with check_sum set it kept
+				 * growing puh->len. The position of the next
+				 * packet cannot be trusted, drop the rest.
+				 */
+				break;
 			}
 
 			kt = ktime_get();

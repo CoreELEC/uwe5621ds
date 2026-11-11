@@ -141,8 +141,30 @@ static struct sk_buff
 	struct rx_msdu_desc *msdu_desc = (struct rx_msdu_desc *)pskb->data;
 	unsigned short offset = 0, frag_len = 0, frag_offset = 0;
 	struct sk_buff *skb = NULL, *pos_skb = NULL;
+	unsigned int hdr_len = msdu_desc->snap_hdr_present ?
+			       ETH_HLEN : 2 * ETH_ALEN;
 
 	node = get_defrag_node(defrag_entry, msdu_desc);
+	/*
+	 * Fragment lengths are derived from received frames. A fragment
+	 * shorter than its 802.3 header used to make frag_len wrap to
+	 * ~64K (the reassembly then copied that much from the fragment),
+	 * and the data must also fit in the fragment's buffer. The
+	 * reassembled length must fit the 16-bit msdu_len field.
+	 */
+	if (node && (msdu_desc->msdu_len < hdr_len ||
+		     msdu_total_len(msdu_desc) > skb_tailroom(pskb) ||
+		     node->msdu_len + msdu_desc->msdu_len - hdr_len >
+		     U16_MAX)) {
+		wl_err("%s: drop invalid fragment, len: %d, offset: %d\n",
+		       __func__, msdu_desc->msdu_len, msdu_desc->msdu_offset);
+		skb_queue_purge(&node->skb_list);
+		/* the next fragment of this MSDU will not match any more */
+		node->last_frag_num = 0xff;
+		dev_kfree_skb(pskb);
+		return NULL;
+	}
+
 	if (node) {
 		skb_queue_tail(&node->skb_list, pskb);
 		if (msdu_desc->snap_hdr_present)

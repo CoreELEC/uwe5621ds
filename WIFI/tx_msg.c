@@ -1746,12 +1746,16 @@ int sprdwl_tx_filter_ip_pkt(struct sk_buff *skb, struct net_device *ndev)
 	intf = (struct sprdwl_intf *)vif->priv->hw_priv;
 
 	if (ethhdr->h_proto == htons(ETH_P_IPV6)) {
+		if (skb_headlen(skb) < ETHER_HDR_LEN + sizeof(*ipv6hdr))
+			return 1;
 		ipv6hdr = (struct ipv6hdr *)(skb->data + ETHER_HDR_LEN);
 		/* check for udp header */
 		if (ipv6hdr->nexthdr != IPPROTO_UDP)
 			return 1;
 		iphdrlen = sizeof(*ipv6hdr);
 	} else if (ethhdr->h_proto == htons(ETH_P_IP)) {
+		if (skb_headlen(skb) < ETHER_HDR_LEN + sizeof(*iphdr))
+			return 1;
 		iphdr = (struct iphdr *)(skb->data + ETHER_HDR_LEN);
 		/* check for udp header */
 		if (iphdr->protocol != IPPROTO_UDP)
@@ -1761,6 +1765,9 @@ int sprdwl_tx_filter_ip_pkt(struct sk_buff *skb, struct net_device *ndev)
 		return 1;
 	}
 
+	/* the UDP header is read below: it must be in the buffer */
+	if (skb_headlen(skb) < ETHER_HDR_LEN + iphdrlen + sizeof(*udphdr))
+		return 1;
 	udphdr = (struct udphdr *)(skb->data + ETHER_HDR_LEN + iphdrlen);
 
 	is_ipv4_dhcp =
@@ -1795,7 +1802,10 @@ int sprdwl_tx_filter_ip_pkt(struct sk_buff *skb, struct net_device *ndev)
 		intf->skb_da = skb->data;
 		lut_index = sprdwl_find_lut_index(intf, vif);
 		dhcpdata = skb->data + ETHER_HDR_LEN + iphdrlen + 250;
-		if (*dhcpdata == 0x01) {
+		/* short (e.g. locally crafted) UDP packets to port 67/68 */
+		if (dhcpdata >= skb->data + skb_headlen(skb)) {
+			/* not a DHCP message we can parse, log nothing */
+		} else if (*dhcpdata == 0x01) {
 			wl_info("DHCP: TX DISCOVER\n");
 		} else if (*dhcpdata == 0x02) {
 			wl_info("DHCP: TX OFFER\n");

@@ -121,6 +121,8 @@ static void dbg_ini_parse(struct dbg_ini_cfg *cfg, char *buf, int size)
 				sec = SEC_INVALID;
 			}
 		} else {
+			/* every line is parsed from its start */
+			index = 0;
 			while (line[index] != '=' && line[index] != '\0')
 				index++;
 

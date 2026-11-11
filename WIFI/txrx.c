@@ -169,13 +169,14 @@ void sprdwl_rx_skb_process(struct sprdwl_priv *priv, struct sk_buff *skb)
 	struct ethhdr *eth;
 	struct sprdwl_rx_if *rx_if;
 
-	intf = (struct sprdwl_intf *)priv->hw_priv;
-	rx_if = (struct sprdwl_rx_if *)intf->sprdwl_rx;
-
 	if (unlikely(!priv)) {
 		wl_err("%s priv not init.\n", __func__);
-		goto err;
+		dev_kfree_skb(skb);
+		return;
 	}
+
+	intf = (struct sprdwl_intf *)priv->hw_priv;
+	rx_if = (struct sprdwl_rx_if *)intf->sprdwl_rx;
 
 	msdu_desc = (struct rx_msdu_desc *)skb->data;
 	if (msdu_desc->ctx_id >= SPRDWL_MAC_INDEX_MAX) {
@@ -230,6 +231,20 @@ void sprdwl_rx_skb_process(struct sprdwl_priv *priv, struct sk_buff *skb)
 	}
 
 	ndev = vif->ndev;
+
+	/*
+	 * msdu_offset/msdu_len come from the firmware descriptor. If they
+	 * do not fit in the buffer skb_put() would hit skb_over_panic(),
+	 * i.e. a single corrupted transfer would bring down the kernel.
+	 */
+	if (unlikely(msdu_desc->msdu_len < ETH_HLEN ||
+		     (unsigned int)msdu_desc->msdu_offset +
+		     msdu_desc->msdu_len > skb_tailroom(skb))) {
+		wl_err("%s invalid msdu offset %d / len %d\n", __func__,
+		       msdu_desc->msdu_offset, msdu_desc->msdu_len);
+		sprdwl_put_vif(vif);
+		goto err;
+	}
 	skb_reserve(skb, msdu_desc->msdu_offset);
 	skb_put(skb, msdu_desc->msdu_len);
 
@@ -239,6 +254,8 @@ void sprdwl_rx_skb_process(struct sprdwl_priv *priv, struct sk_buff *skb)
 			wl_err("%s, drop loopback pkt, macaddr:%02x:%02x:%02x:%02x:%02x:%02x\n",
 				__func__, skb->data[0], skb->data[1], skb->data[2],
 				skb->data[3], skb->data[4], skb->data[5]);
+			/* drop the reference taken by ctx_id_to_vif() */
+			sprdwl_put_vif(vif);
 			goto err;
 		}
 

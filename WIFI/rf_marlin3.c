@@ -297,7 +297,7 @@ static void get_cmd_par(char *str, struct nvm_cali_cmd *cmd)
 	int i, j, bufType, cType, flag;
 	char tmp[128];
 	char c;
-	long val;
+	long val = 0;	/* kstrtol() leaves it untouched on error */
 
 	bufType = -1;
 	cType = 0;
@@ -310,8 +310,9 @@ static void get_cmd_par(char *str, struct nvm_cali_cmd *cmd)
 		if ((1 == cType) ||
 			(2 == cType) ||
 			(3 == cType)) {
-			tmp[j] = c;
-			j++;
+			/* tokens longer than tmp[] are truncated */
+			if (j < sizeof(tmp) - 1)
+				tmp[j++] = c;
 			if (-1 == bufType) {
 				if (2 == cType)
 					bufType = 2;
@@ -327,9 +328,9 @@ static void get_cmd_par(char *str, struct nvm_cali_cmd *cmd)
 			tmp[j] = '\0';
 
 			if ((1 == bufType) && (0 == flag)) {
-				strcpy(cmd->itm, tmp);
+				strscpy((char *)cmd->itm, tmp, sizeof(cmd->itm));
 				flag = 1;
-			} else {
+			} else if (cmd->num < ARRAY_SIZE(cmd->par)) {
 				if (kstrtol(tmp, 0, &val))
 					wl_info(" %s ", tmp);
 			/* pr_err("kstrtol %s: error\n", tmp); */

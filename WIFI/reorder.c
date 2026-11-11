@@ -842,6 +842,13 @@ void wlan_ba_session_event(void *hw_intf,
 		wlan_filter_event(ba_entry, ba_event);
 		break;
 	case SPRDWL_DELTXBA_EVENT:
+		/* firmware supplied index into peer_entry[MAX_LUT_NUM] */
+		if (ba_event->sta_lut_index >= MAX_LUT_NUM ||
+		    ba_event->tid >= NUM_TIDS) {
+			wl_err("%s, invalid lut index %d / tid %d\n", __func__,
+			       ba_event->sta_lut_index, ba_event->tid);
+			break;
+		}
 		peer_entry = &intf->peer_entry[ba_event->sta_lut_index];
 		qos_index = tid_map_to_qosindex(ba_event->tid);
 		peer_entry = &intf->peer_entry[ba_event->sta_lut_index];
