@@ -181,8 +181,17 @@ void sprdwl_rx_process(struct sprdwl_rx_if *rx_if, struct sk_buff *pskb)
 
 	if (!skb_queue_empty(&rx_if->net_rx_list)) {
 #if defined RX_NAPI
-		if (rx_if->napi_rx_enable)
+		/*
+		 * Called from the RX kthread: raising NET_RX_SOFTIRQ from
+		 * process context only marks it pending, so the poll would
+		 * wait for the next interrupt/bh enable on this CPU. Run it
+		 * right away when re-enabling bottom halves.
+		 */
+		if (rx_if->napi_rx_enable) {
+			local_bh_disable();
 			napi_schedule(&rx_if->napi_rx);
+			local_bh_enable();
+		}
 #elif defined SPLIT_STACK
 		if (!work_pending(&rx_if->rx_net_work))
 			queue_work(rx_if->rx_net_workq, &rx_if->rx_net_work);

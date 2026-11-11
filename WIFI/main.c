@@ -72,19 +72,18 @@ void sprdwl_netif_rx(struct sk_buff *skb, struct net_device *ndev)
 	struct sprdwl_intf *intf;
 	struct sprdwl_rx_if *rx_if = NULL;
 
-	ktime_t kt;
 	u32 sec;
 
 	vif = netdev_priv(ndev);
 	intf = (struct sprdwl_intf *)(vif->priv->hw_priv);
 	rx_if = (struct sprdwl_rx_if *)intf->sprdwl_rx;
 
-	kt = ktime_get();
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
-	sec = (u32)(div_u64(kt, NSEC_PER_SEC));
-#else/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
-	sec = (u32)(div_u64(kt.tv64, NSEC_PER_SEC));
-#endif/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
+	/*
+	 * Per-packet throughput accounting: only the second is needed,
+	 * ktime_get_seconds() gives it without a clocksource read
+	 * and a 64-bit division.
+	 */
+	sec = (u32)ktime_get_seconds();
 	vif->throughtput_rx.bytes += skb->len;
 	if (vif->throughtput_rx.sec != sec) {
 		vif->throughtput_rx.throughtput = (vif->throughtput_rx.bytes * 8) >> 10;
@@ -228,7 +227,6 @@ static netdev_tx_t sprdwl_start_xmit(struct sk_buff *skb, struct net_device *nde
 	struct sprdwl_eap_hdr *eap_temp;
 	struct sprdwl_intf *intf;
 
-	ktime_t kt;
 	u32 sec;
 
 	intf = (struct sprdwl_intf *)vif->priv->hw_priv;
@@ -300,12 +298,12 @@ static netdev_tx_t sprdwl_start_xmit(struct sk_buff *skb, struct net_device *nde
 		return NETDEV_TX_OK;
 	}
 
-	kt = ktime_get();
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
-	sec = (u32)(div_u64(kt, NSEC_PER_SEC));
-#else/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
-	sec = (u32)(div_u64(kt.tv64, NSEC_PER_SEC));
-#endif/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
+	/*
+	 * Per-packet throughput accounting: only the second is needed,
+	 * ktime_get_seconds() gives it without a clocksource read
+	 * and a 64-bit division.
+	 */
+	sec = (u32)ktime_get_seconds();
 	vif->throughtput_tx.bytes += skb->len;
 	if (vif->throughtput_tx.sec != sec) {
 		vif->throughtput_tx.throughtput = (vif->throughtput_tx.bytes * 8) >> 10;

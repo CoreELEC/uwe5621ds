@@ -2845,6 +2845,14 @@ void sprdwl_cfg80211_dump_frame_prot_info(int send, int freq,
 	 */
 	char p[PRINT_BUF_LEN];
 
+	/*
+	 * This runs for every received scan result and mgmt frame, but
+	 * its only output is a debug message: skip the formatting work
+	 * unless that message would be printed.
+	 */
+	if (sprdwl_debug_level < L_DBG)
+		return;
+
 	/* need at least frame control + addr1 + addr2 for the output */
 	if (!buf || len < ADDR2_OFFSET + ETH_ALEN)
 		return;
