@@ -1074,6 +1074,26 @@ static struct net_device_ops sprdwl_netdev_ops = {
 	.ndo_set_mac_address = sprdwl_set_mac,
 };
 
+/*
+ * CP2 reset notification. The BSP calls the registered function as
+ * marlin_reset_callback, i.e. int (*)(void *). if_ops->force_exit is
+ * void (*)(void *): registering it directly made the indirect call a
+ * function type mismatch, which is a fatal "CFI failure" with kCFI.
+ */
+static int sprdwl_marlin_reset_notify(void *para)
+{
+	struct sprdwl_priv *priv = g_sprdwl_priv;
+
+	if (!priv || !priv->if_ops || !priv->if_ops->force_exit)
+		return 0;
+#if defined(UWE5621_FTR)
+	priv->if_ops->force_exit(para);
+#else
+	priv->if_ops->force_exit();
+#endif
+	return 0;
+}
+
 /* true if @ndev was created by this driver (netdev_priv is a sprdwl_vif) */
 bool sprdwl_is_sprdwl_netdev(const struct net_device *ndev)
 {
@@ -1840,7 +1860,8 @@ int sprdwl_core_init(struct device *dev, struct sprdwl_priv *priv)
 
 	trace_info_init();
 
-	ret = marlin_reset_register_notify(priv->if_ops->force_exit, priv->hw_priv);
+	ret = marlin_reset_register_notify(sprdwl_marlin_reset_notify,
+					   priv->hw_priv);
 	if (ret) {
 		wl_err("%s failed to register wcn cp rest notify(%d)!\n",
 		       __func__, ret);

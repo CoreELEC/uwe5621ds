@@ -82,7 +82,12 @@ extern void mmc_power_up(struct mmc_host *host, u32 ocr);
 extern void mmc_power_off(struct mmc_host *host);
 #endif
 
-static int (*scan_card_notify)(void);
+/*
+ * Must match the type of the registered callback (marlin_scan_finish()
+ * is void (void)): with kCFI an indirect call through a pointer of a
+ * different function type is a fatal "CFI failure".
+ */
+static void (*scan_card_notify)(void);
 struct sdiohal_data_t *sdiohal_data;
 static struct sdio_driver sdiohal_driver;
 
