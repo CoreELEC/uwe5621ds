@@ -88,6 +88,7 @@ void parse_frame(data_ready_cb data_ready, frame_complete_cb frame_complete)
             memset(rd->preamble, 0, PREAMBLE_BUFFER_SIZE);
             rd->index = 0;
             rd->state = PREAMBLE;
+            fallthrough;
 
         case PREAMBLE:
             rd->preamble[rd->index] = byte;
@@ -102,6 +103,18 @@ void parse_frame(data_ready_cb data_ready, frame_complete_cb frame_complete)
                     : byte;
                 buffer_size = rd->index
                               + rd->bytes_remaining;
+                /*
+                 * rd->buffer holds HCI_HAL_SERIAL_BUFFER_SIZE bytes
+                 * plus the alignment padding; an ACL length from user
+                 * space can be up to 64K. Drop anything larger.
+                 */
+                if (buffer_size > HCI_HAL_SERIAL_BUFFER_SIZE)
+                {
+                    pr_err("%s: type %u packet too large (%zu), dropped\n",
+                           __func__, rd->type, buffer_size);
+                    rd->state = IGNORE;
+                    break;
+                }
                 memcpy(rd->buffer,
                        rd->preamble,
                        rd->index);
@@ -127,19 +140,19 @@ void parse_frame(data_ready_cb data_ready, frame_complete_cb frame_complete)
             break;
 
         case IGNORE:
-            pr_err("PARSE IGNORE\n");
             rd->bytes_remaining--;
 
+            /* keep parsing: the fifo may already hold the next packet */
             if (rd->bytes_remaining == 0)
             {
                 rd->state = BRAND_NEW;
-                return;
             }
 
             break;
 
         case FINISHED:
             pr_err("%s state.\n", __func__);
+            rd->state = BRAND_NEW;
             break;
 
         default:
@@ -177,7 +190,7 @@ int sitm_write(const uint8_t *buf, int count, frame_complete_cb frame_complete)
     if (!rd)
     {
         pr_err("hci fifo no memory\n");
-        return count;
+        return -ENODEV;
     }
 
     ret = kfifo_avail(&rd->fifo);

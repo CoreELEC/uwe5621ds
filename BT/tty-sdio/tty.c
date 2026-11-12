@@ -123,7 +123,11 @@ static int mtty_open(struct tty_struct *tty, struct file *filp)
     tty->driver_data = (void *)mtty;
 
     atomic_set(&mtty->state, MTTY_STATE_OPEN);
-    sitm_init();
+    if (sitm_init())
+    {
+        pr_err("mtty open: sitm_init failed\n");
+        return -ENOMEM;
+    }
     //pr_info("%s device success! pid %d %d %d sid %d\n", __func__, task_pid_nr(current), current->pid, pid_nr(get_task_pid(current, PIDTYPE_PID)),
     //        pid_nr(get_task_pid(current, PIDTYPE_SID)));
 
@@ -145,6 +149,12 @@ static void mtty_close(struct tty_struct *tty, struct file *filp)
     if (mtty == NULL)
     {
         pr_err("mtty close s tty is NULL!\n");
+        return;
+    }
+
+    /* close() runs for every open file; tear down only on the last one */
+    if (tty->count > 1)
+    {
         return;
     }
 
@@ -173,6 +183,10 @@ static inline int mtty_transfer_upper(const unsigned char *buf, int count)
 
 static int mtty_recv(const unsigned char *buf, int count)
 {
+    if (mtty_dev == NULL || mtty_dev->port == NULL)
+    {
+        return count;
+    }
     //pr_err("mtty_recv count:%d\n", count);
     //hex_dump_block(buf, count);
     //return mtty_transfer_upper(buf, count);
@@ -280,6 +294,9 @@ static int mtty_tty_driver_init(struct mtty_device *device)
 
     if (IS_ERR(driver))
     {
+        tty_port_destroy(device->port);
+        kfree(device->port);
+        device->port = NULL;
         return PTR_ERR(driver);
     }
 
@@ -318,7 +335,10 @@ static int mtty_tty_driver_init(struct mtty_device *device)
     {
         /* put_tty_driver() was removed in Linux 5.15 (our floor). */
         tty_driver_kref_put(driver);
+        device->driver = NULL;
         tty_port_destroy(device->port);
+        kfree(device->port);
+        device->port = NULL;
         return ret;
     }
 
@@ -407,6 +427,11 @@ static ssize_t woble_set_store(struct device *dev, struct device_attribute *attr
     unsigned char *p = (unsigned char *) buf;
     unsigned char opcode = 0;
     unsigned short handler = 0;
+
+    if (count < 1)
+    {
+        return -EINVAL;
+    }
     STREAM_TO_UINT8(opcode, p);
 
     pr_info("%s, len %zu op: %d\n", __func__, count, opcode);
@@ -418,12 +443,21 @@ static ssize_t woble_set_store(struct device *dev, struct device_attribute *attr
         break;
 
     case WOBLE_KERNEL_OP_SET_OWN:
+        if (count < 1 + BD_ADDR_LEN)
+        {
+            return -EINVAL;
+        }
         set_random_address(p);
         break;
 
     case WOBLE_KERNEL_OP_ADD_RMT:
     {
         unsigned char type = 0;
+
+        if (count < 1 + 1 + 2 + BD_ADDR_LEN)
+        {
+            return -EINVAL;
+        }
         STREAM_TO_UINT8(type, p);
         STREAM_TO_UINT16(handler, p);
         pr_info("%s, get type: %d\n", __func__, type);
@@ -434,6 +468,11 @@ static ssize_t woble_set_store(struct device *dev, struct device_attribute *attr
     case WOBLE_KERNEL_OP_DEL_RMT:
     {
         unsigned char type = 0;
+
+        if (count < 1 + 1 + BD_ADDR_LEN)
+        {
+            return -EINVAL;
+        }
         STREAM_TO_UINT8(type, p);
         pr_info("%s, get type: %d\n", __func__, type);
         del_woble_devices(type, p);
@@ -498,13 +537,13 @@ static ssize_t misc_node_store(struct device *dev,
     const char *tbuf = buf;
     pr_info("%s\n", __func__);
 
-    if (memcmp("AT+BTLOG=", buf, strlen("AT+BTLOG=")) == 0 && count >= strlen("AT+BTLOG=") + 1)
+    if (count >= strlen("AT+BTLOG=") + 1 && memcmp("AT+BTLOG=", buf, strlen("AT+BTLOG=")) == 0)
     {
         tbuf += strlen("AT+BTLOG=");
         STREAM_TO_UINT8(opcode, tbuf);
         set_log_level(opcode - '0');
     }
-    else if (memcmp("AT+SLEEP=", buf, strlen("AT+SLEEP=")) == 0 && count >= strlen("AT+SLEEP=") + 1)
+    else if (count >= strlen("AT+SLEEP=") + 1 && memcmp("AT+SLEEP=", buf, strlen("AT+SLEEP=")) == 0)
     {
         unsigned char is_resume = 0;
         tbuf += strlen("AT+SLEEP=");
@@ -566,8 +605,8 @@ static ssize_t misc_node_show(struct device *dev,
  */
 static DEVICE_ATTR(at, 0660, at_show, at_store);
 static DEVICE_ATTR(woble_set, 0660, woble_set_show, woble_set_store);
-static DEVICE_ATTR(ant_num, 0660, ant_num_show, 0);
-static DEVICE_ATTR(chipid, 0660, chipid_show, 0);
+static DEVICE_ATTR(ant_num, 0444, ant_num_show, 0);
+static DEVICE_ATTR(chipid, 0444, chipid_show, 0);
 static DEVICE_ATTR(misc_node, 0660, misc_node_show, misc_node_store);
 
 struct attribute *bluetooth_attrs[] =
@@ -630,8 +669,7 @@ static int mtty_probe(struct platform_device *pdev)
 
     if (rval)
     {
-        mtty_tty_driver_exit(mtty);
-        kfree(mtty->port);
+        /* mtty_tty_driver_init() already undid its own work */
         kfree(mtty);
         mtty_destroy_pdata(&pdata);
         pr_err("%s register notifier failed (%d)\n", __func__, rval);
@@ -673,8 +711,11 @@ static void mtty_remove(struct platform_device *pdev)
     struct mtty_device *mtty = platform_get_drvdata(pdev);
     rfkill_bluetooth_remove(pdev);
     pr_err("%s\n", __func__);
-    mtty_tty_driver_exit(mtty);
+    /* stop rx first: it pushes into mtty->port, freed below */
     bt_data_interface->cleanup();
+    sysfs_remove_group(&(pdev->dev.kobj), &bluetooth_group);
+    mtty_tty_driver_exit(mtty);
+    mtty_dev = NULL;
     kfree(mtty->port);
     mtty_destroy_pdata(&mtty->pdata);
     /*tasklet_kill(&mtty->rx_task);*/
@@ -725,6 +766,7 @@ static struct platform_device uwe5621_bt_tty_device =
 static const struct of_device_id mtty_match_table[] =
 {
     { .compatible = "sprd,mtty", },
+    { /* sentinel: of_match_table must be terminated */ },
 };
 static struct platform_driver uwe5621_bt_tty_driver =
 {
@@ -748,9 +790,20 @@ module_platform_driver(uwe5621_bt_tty_driver);
 
 static int __init uwe5621_bt_tty_init(void)
 {
+    int ret;
+
     pr_err("%s\n", __func__);
-    platform_device_register(&uwe5621_bt_tty_device);
-    return platform_driver_register(&uwe5621_bt_tty_driver);
+    ret = platform_device_register(&uwe5621_bt_tty_device);
+    if (ret)
+    {
+        return ret;
+    }
+    ret = platform_driver_register(&uwe5621_bt_tty_driver);
+    if (ret)
+    {
+        platform_device_unregister(&uwe5621_bt_tty_device);
+    }
+    return ret;
 }
 
 static void __exit uwe5621_bt_tty_exit(void)

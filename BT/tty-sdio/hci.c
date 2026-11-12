@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/semaphore.h>
 #include <linux/vmalloc.h>
+#include <linux/jiffies.h>
 #include "include/hci.h"
 #include "include/sitm.h"
 
@@ -41,6 +42,8 @@ static struct woble_dev_t woble_devices[WOBLE_DEVICES_SIZE];
 
 
 static struct hci_cmd_t hci_cmd;
+
+#define HCI_CMD_TIMEOUT_MS 2000
 
 static int recv_kernel_event(const unsigned char *buf, int length, int pack_enum)
 {
@@ -76,7 +79,8 @@ static int recv_kernel_event(const unsigned char *buf, int length, int pack_enum
         ret = 0;
     }
 
-    if(opcode == 0x1009)
+    /* Read BD_ADDR: status(1) + address(6) after the opcode */
+    if (opcode == 0x1009 && pack_enum == BT_HCI_EVT_CMD_COMPLETE && length >= 13)
     {
         STREAM_TO_ARRAY(own_public_addr, p, BD_ADDR_LEN);
         pr_err("%s address %02x:%02x:%02x:%02x:%02x:%02x\n", __func__,
@@ -98,6 +102,7 @@ int rx_data_recv(const unsigned char *buf, int count,
     if (count <= 0)
     {
         pr_err("%s count <0 !!!!!", __func__);
+        return count;
     }
 
     do
@@ -112,6 +117,8 @@ int rx_data_recv(const unsigned char *buf, int count,
             if (left_length < 3)
             {
                 pr_err("%s left_length <3 !!!!!", __func__);
+                left_length = 0;
+                break;
             }
 
             pack_length = rxmsg[EVT_HEADER_SIZE];
@@ -119,8 +126,10 @@ int rx_data_recv(const unsigned char *buf, int count,
 
             if (left_length - pack_length < 0)
             {
+                /* truncated: never pass bytes beyond the rx buffer up */
                 pr_err("%s left_length - pack_length <0 !!!!!", __func__);
-
+                left_length = 0;
+                break;
             }
 
             switch (rxmsg[EVT_HEADER_EVENT])
@@ -148,6 +157,8 @@ int rx_data_recv(const unsigned char *buf, int count,
             if (left_length < 5)
             {
                 pr_err("%s left_length <5 !!!!!", __func__);
+                left_length = 0;
+                break;
             }
 
             pack_length = rxmsg[ACL_HEADER_SIZE_HB];
@@ -166,7 +177,7 @@ int rx_data_recv(const unsigned char *buf, int count,
             break;
 
         default:
-            pr_err("%s unknown package left_length %d last %d data %x %x %x %x!!!!!\n", __func__, left_length, last, rxmsg[0], rxmsg[1], rxmsg[2], rxmsg[3]);
+            pr_err("%s unknown package left_length %d last %d data %x!!!!!\n", __func__, left_length, last, rxmsg[0]);
 
             if (0)
             {
@@ -192,7 +203,7 @@ int rx_data_recv(const unsigned char *buf, int count,
 
         //pr_info("%s left: %d\n",__func__ , left_length);
     }
-    while (left_length);
+    while (left_length > 0);
 
     return count;
 }
@@ -373,6 +384,12 @@ void hci_woble_enable(void)
     int i;
     struct HC_BT_HDR *disc_payload = (struct HC_BT_HDR *)vmalloc(sizeof(struct HC_BT_HDR) + 3);
 
+    if (!payload || !disc_payload)
+    {
+        vfree(payload);
+        vfree(disc_payload);
+        return;
+    }
     payload->len = 3;
     payload->data[0] = 0;
     payload->data[1] = 0;
@@ -383,7 +400,14 @@ void hci_woble_enable(void)
 
     hci_cmd_send_sync(BT_HCI_OP_RESET, NULL, NULL);
 
-    payload = (struct HC_BT_HDR *)vmalloc(sizeof(struct HC_BT_HDR) + 100);
+    /* own address(6) + count(1) + WOBLE_DEVICES_SIZE * (type(1) + address(6)) */
+    payload = (struct HC_BT_HDR *)vmalloc(sizeof(struct HC_BT_HDR) + BD_ADDR_LEN + 1 +
+                                          WOBLE_DEVICES_SIZE * (1 + BD_ADDR_LEN));
+    if (!payload)
+    {
+        vfree(disc_payload);
+        return;
+    }
     p = payload->data;
     BDADDR_TO_STREAM(p, own_addr);
     UINT8_TO_STREAM(p, 0);
@@ -434,6 +458,10 @@ void hci_set_ap_sleep_mode(int is_shutdown, int is_resume)
 {
     struct HC_BT_HDR *payload = (struct HC_BT_HDR *)vmalloc(sizeof(struct HC_BT_HDR) + 6);
     unsigned char *p;
+    if (!payload)
+    {
+        return;
+    }
     p = payload->data;
 
     pr_err("%s start\n", __func__);
@@ -462,6 +490,10 @@ void hci_set_scan_parameters(void)
 {
     struct HC_BT_HDR *payload = (struct HC_BT_HDR *)vmalloc(sizeof(struct HC_BT_HDR) + 8);
     unsigned char *p;
+    if (!payload)
+    {
+        return;
+    }
     p = payload->data;
 
     pr_err("%s start\n", __func__);
@@ -487,6 +519,10 @@ void hci_set_scan_enable(int enable)
 {
     struct HC_BT_HDR *payload = (struct HC_BT_HDR *)vmalloc(sizeof(struct HC_BT_HDR) + 6);
     unsigned char *p;
+    if (!payload)
+    {
+        return;
+    }
     p = payload->data;
 
     pr_err("%s start\n", __func__);
@@ -511,7 +547,13 @@ void hci_add_device_to_wakeup_list(void)
     struct HC_BT_HDR *payload = (struct HC_BT_HDR *)vmalloc(sizeof(struct HC_BT_HDR) + 34);
     unsigned char *p;
     unsigned char address[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    if (!payload)
+    {
+        return;
+    }
     p = payload->data;
+    /* stays 0 (no parameters) for any other WOBLE_TYPE */
+    payload->len = 0;
 
     pr_err("%s start\n", __func__);
 

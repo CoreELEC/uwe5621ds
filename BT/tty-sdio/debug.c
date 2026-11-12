@@ -52,6 +52,11 @@ void hex_dump(unsigned char *bin, size_t binsz)
     char *str, hex_str[] = "0123456789ABCDEF";
     size_t i;
 
+    if (bin == NULL || binsz == 0)
+    {
+        return;
+    }
+
     str = (char *)vmalloc(binsz * 3);
 
     if (!str)

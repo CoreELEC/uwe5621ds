@@ -43,18 +43,6 @@ int bluetooth_set_power(void *data, bool blocked)
     }
     else
     {
-        if (is_power_on)
-        {
-            struct HC_BT_HDR *payload = (struct HC_BT_HDR *)vmalloc(sizeof(struct HC_BT_HDR) + 3);
-
-            payload->len = 3;
-            payload->data[0] = 0;
-            payload->data[1] = 0;
-            payload->data[2] = 0;
-
-            //hci_cmd_send_sync(0xfca1, payload, NULL);
-        }
-
         is_power_on = 0;
         stop_marlin(MARLIN_BLUETOOTH);
     }
