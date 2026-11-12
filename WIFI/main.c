@@ -45,19 +45,25 @@
 
 struct sprdwl_priv *g_sprdwl_priv;
 
-static void str2mac(const char *mac_addr, u8 *mac)
+static int str2mac(const char *mac_addr, u8 *mac)
 {
 	unsigned int m[ETH_ALEN];
 
 	if (sscanf(mac_addr, "%02x:%02x:%02x:%02x:%02x:%02x",
-		   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != ETH_ALEN)
+		   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != ETH_ALEN) {
 		wl_err("failed to parse mac address '%s'", mac_addr);
+		/* m[] is (partly) uninitialized here, do not use it */
+		eth_zero_addr(mac);
+		return -EINVAL;
+	}
 	mac[0] = m[0];
 	mac[1] = m[1];
 	mac[2] = m[2];
 	mac[3] = m[3];
 	mac[4] = m[4];
 	mac[5] = m[5];
+
+	return 0;
 }
 
 void sprdwl_netif_rx(struct sk_buff *skb, struct net_device *ndev)
@@ -66,19 +72,18 @@ void sprdwl_netif_rx(struct sk_buff *skb, struct net_device *ndev)
 	struct sprdwl_intf *intf;
 	struct sprdwl_rx_if *rx_if = NULL;
 
-	ktime_t kt;
 	u32 sec;
 
 	vif = netdev_priv(ndev);
 	intf = (struct sprdwl_intf *)(vif->priv->hw_priv);
 	rx_if = (struct sprdwl_rx_if *)intf->sprdwl_rx;
 
-	kt = ktime_get();
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
-	sec = (u32)(div_u64(kt, NSEC_PER_SEC));
-#else/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
-	sec = (u32)(div_u64(kt.tv64, NSEC_PER_SEC));
-#endif/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
+	/*
+	 * Per-packet throughput accounting: only the second is needed,
+	 * ktime_get_seconds() gives it without a clocksource read
+	 * and a 64-bit division.
+	 */
+	sec = (u32)ktime_get_seconds();
 	vif->throughtput_rx.bytes += skb->len;
 	if (vif->throughtput_rx.sec != sec) {
 		vif->throughtput_rx.throughtput = (vif->throughtput_rx.bytes * 8) >> 10;
@@ -222,7 +227,6 @@ static netdev_tx_t sprdwl_start_xmit(struct sk_buff *skb, struct net_device *nde
 	struct sprdwl_eap_hdr *eap_temp;
 	struct sprdwl_intf *intf;
 
-	ktime_t kt;
 	u32 sec;
 
 	intf = (struct sprdwl_intf *)vif->priv->hw_priv;
@@ -255,7 +259,9 @@ static netdev_tx_t sprdwl_start_xmit(struct sk_buff *skb, struct net_device *nde
 		skb->protocol == cpu_to_be16(ETH_P_PAE) &&
 		eap_temp->type == EAP_PACKET_TYPE &&
 		eap_temp->code == EAP_FAILURE_CODE) {
-		sprdwl_xmit_data2cmd(skb, ndev);
+		/* -EAGAIN is the only error on which the skb is not freed */
+		if (sprdwl_xmit_data2cmd(skb, ndev) == -EAGAIN)
+			dev_kfree_skb(skb);
 		return NETDEV_TX_OK;
 	}
 
@@ -292,12 +298,12 @@ static netdev_tx_t sprdwl_start_xmit(struct sk_buff *skb, struct net_device *nde
 		return NETDEV_TX_OK;
 	}
 
-	kt = ktime_get();
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
-	sec = (u32)(div_u64(kt, NSEC_PER_SEC));
-#else/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
-	sec = (u32)(div_u64(kt.tv64, NSEC_PER_SEC));
-#endif/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
+	/*
+	 * Per-packet throughput accounting: only the second is needed,
+	 * ktime_get_seconds() gives it without a clocksource read
+	 * and a 64-bit division.
+	 */
+	sec = (u32)ktime_get_seconds();
 	vif->throughtput_tx.bytes += skb->len;
 	if (vif->throughtput_tx.sec != sec) {
 		vif->throughtput_tx.throughtput = (vif->throughtput_tx.bytes * 8) >> 10;
@@ -313,8 +319,13 @@ static netdev_tx_t sprdwl_start_xmit(struct sk_buff *skb, struct net_device *nde
 	if (!msg) {
 		wl_err("%s, %d, get msg bug failed\n", __func__, __LINE__);
 		ndev->stats.tx_fifo_errors++;
+		/*
+		 * The skb is freed here, so it must be reported as consumed:
+		 * NETDEV_TX_BUSY would make the stack requeue (and later free
+		 * again) an skb that no longer exists.
+		 */
 		dev_kfree_skb(skb);
-		return NETDEV_TX_BUSY;
+		return NETDEV_TX_OK;
 	}
 
 	if (skb_headroom(skb) < ndev->needed_headroom) {
@@ -466,7 +477,14 @@ static void sprdwl_tx_timeout(struct net_device *ndev)
 #define CMD_SET_AP_WPS_P2P_IE    "SET_AP_WPS_P2P_IE"
 #define CMD_GTK_REKEY_OFFLOAD    "GTK_REKEY_OFFLOAD"
 
-static int sprdwl_priv_cmd(struct net_device *ndev, struct ifreq *ifr)
+/*
+ * Copy the android_wifi_priv_cmd header from user space. With
+ * ndo_siocdevprivate the user pointer is passed in @data: for a 32-bit
+ * caller on a 64-bit kernel ifr->ifr_data is not a valid pointer, so it
+ * must not be used. The header layout also differs for compat callers.
+ */
+static int sprdwl_get_priv_cmd(void __user *data,
+			       struct android_wifi_priv_cmd *priv_cmd)
 {
 #ifdef CONFIG_COMPAT
 	struct compat_android_wifi_priv_cmd {
@@ -475,18 +493,8 @@ static int sprdwl_priv_cmd(struct net_device *ndev, struct ifreq *ifr)
 		int total_len;
 	};
 #endif /* CONFIG_COMPAT */
-	int n_clients;
-	struct sprdwl_vif *vif = netdev_priv(ndev);
-	struct sprdwl_priv *priv = vif->priv;
-	struct android_wifi_priv_cmd priv_cmd;
-	char *command = NULL, *country = NULL;
-	u16 interval = 0;
-	int max_len;
-	u8 feat = 0, status = 0;
-	u8 addr[ETH_ALEN] = {0}, *mac_addr = NULL, *tmp, *mac_list;
-	int ret = 0, skip, counter, index, value;
 
-	if (!ifr->ifr_data)
+	if (!data)
 		return -EINVAL;
 #ifdef CONFIG_COMPAT
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 6, 0))
@@ -496,41 +504,130 @@ static int sprdwl_priv_cmd(struct net_device *ndev, struct ifreq *ifr)
 #endif
 	{
 		struct compat_android_wifi_priv_cmd compat_priv_cmd;
-		if (copy_from_user(&compat_priv_cmd, ifr->ifr_data,
-					sizeof(struct compat_android_wifi_priv_cmd))) {
+
+		if (copy_from_user(&compat_priv_cmd, data,
+				   sizeof(compat_priv_cmd)))
 			return -EFAULT;
-		}
-		priv_cmd.buf = compat_ptr(compat_priv_cmd.buf);
-		priv_cmd.used_len = compat_priv_cmd.used_len;
-		priv_cmd.total_len = compat_priv_cmd.total_len;
+		priv_cmd->buf = compat_ptr(compat_priv_cmd.buf);
+		priv_cmd->used_len = compat_priv_cmd.used_len;
+		priv_cmd->total_len = compat_priv_cmd.total_len;
 	} else
 #endif /* CONFIG_COMPAT */
 	{
-		if (copy_from_user(&priv_cmd, ifr->ifr_data, sizeof(priv_cmd)))
+		if (copy_from_user(priv_cmd, data, sizeof(*priv_cmd)))
 			return -EFAULT;
 	}
 
-	/*add length check to avoid invalid NULL ptr*/
-	if (!priv_cmd.total_len) {
-		wl_ndev_log(L_INFO, ndev, "%s: priv cmd total len is invalid\n", __func__);
+	/* add length check to avoid invalid NULL ptr / negative sizes */
+	if (priv_cmd->total_len <= 0 || !priv_cmd->buf)
 		return -EINVAL;
-	}
+
+	return 0;
+}
+
+/*
+ * Copy the command payload from user space. The buffer is always
+ * allocated two bytes larger than the copied data and zero-filled: the
+ * payload is then NUL terminated, and since a command prefix can only
+ * match when the payload is at least that long, "command + strlen(CMD) + 1"
+ * always points at a NUL terminated string inside the buffer.
+ */
+static char *sprdwl_get_priv_cmd_buf(struct android_wifi_priv_cmd *priv_cmd,
+				     int *len)
+{
+	char *command;
+	int max_len;
 
 	/* fix max_len for mv300(total_len = 4096) */
-	max_len = priv_cmd.total_len > MAX_PRIV_CMD_LEN ? MAX_PRIV_CMD_LEN : priv_cmd.total_len;
-	command = kmalloc(max_len, GFP_KERNEL);
+	max_len = min_t(int, priv_cmd->total_len, MAX_PRIV_CMD_LEN);
+	command = kzalloc(max_len + 2, GFP_KERNEL);
 	if (!command)
-		return -ENOMEM;
-	if (copy_from_user(command, priv_cmd.buf, max_len)) {
-		ret = -EFAULT;
-		goto out;
+		return ERR_PTR(-ENOMEM);
+	if (copy_from_user(command, (void __user *)priv_cmd->buf, max_len)) {
+		kfree(command);
+		return ERR_PTR(-EFAULT);
 	}
+
+	*len = max_len;
+	return command;
+}
+
+/*
+ * WHITE_EN / WHITE_DIS: "<CMD> <count byte><mac>[ <mac>...]", each MAC
+ * taking 18 bytes ("xx:xx:xx:xx:xx:xx" plus a separator).
+ */
+static int sprdwl_priv_cmd_whitelist(struct sprdwl_vif *vif, char *command,
+				     int len, int skip, u8 sub_type)
+{
+	struct sprdwl_priv *priv = vif->priv;
+	u8 *mac_addr, *mac_list;
+	char *tmp;
+	int counter, index, ret;
+
+	if (skip >= len)
+		return -EINVAL;
+
+	counter = (u8)command[skip];
+	wl_ndev_log(L_INFO, vif->ndev, "%s: %s whitelist counter : %d\n",
+		    __func__, sub_type == SPRDWL_SUBCMD_ENABLE ?
+		    "enable" : "disable", counter);
+	if (!counter)
+		return sprdwl_set_whitelist(priv, vif->ctx_id, sub_type, 0, NULL);
+
+	/* the last MAC needs 17 characters, every other one 18 */
+	if (skip + 1 + (counter - 1) * 18 + 17 > len)
+		return -EINVAL;
+
+	mac_list = kmalloc_array(counter, ETH_ALEN, GFP_KERNEL);
+	if (!mac_list)
+		return -ENOMEM;
+
+	mac_addr = mac_list;
+	tmp = command + skip + 1;
+	for (index = 0; index < counter; index++) {
+		if (str2mac(tmp, mac_addr) || !is_valid_ether_addr(mac_addr)) {
+			kfree(mac_list);
+			return 0;
+		}
+		wl_ndev_log(L_INFO, vif->ndev, "%s: whitelist %pM\n",
+			    __func__, mac_addr);
+		mac_addr += ETH_ALEN;
+		tmp += 18;
+	}
+	ret = sprdwl_set_whitelist(priv, vif->ctx_id, sub_type,
+				   counter, mac_list);
+	kfree(mac_list);
+
+	return ret;
+}
+
+static int sprdwl_priv_cmd(struct net_device *ndev, void __user *data)
+{
+	int n_clients;
+	struct sprdwl_vif *vif = netdev_priv(ndev);
+	struct sprdwl_priv *priv = vif->priv;
+	struct android_wifi_priv_cmd priv_cmd;
+	char *command = NULL, *country = NULL;
+	u16 interval = 0;
+	int max_len;
+	u8 feat = 0, status = 0;
+	u8 addr[ETH_ALEN] = {0};
+	int ret = 0, skip, value;
+
+	ret = sprdwl_get_priv_cmd(data, &priv_cmd);
+	if (ret) {
+		wl_ndev_log(L_INFO, ndev, "%s: priv cmd is invalid\n", __func__);
+		return ret;
+	}
+
+	command = sprdwl_get_priv_cmd_buf(&priv_cmd, &max_len);
+	if (IS_ERR(command))
+		return PTR_ERR(command);
 
 	if (!strncasecmp(command, CMD_BLACKLIST_ENABLE,
 			 strlen(CMD_BLACKLIST_ENABLE))) {
 		skip = strlen(CMD_BLACKLIST_ENABLE) + 1;
-		str2mac(command + skip, addr);
-		if (!is_valid_ether_addr(addr))
+		if (str2mac(command + skip, addr) || !is_valid_ether_addr(addr))
 			goto out;
 		wl_ndev_log(L_INFO, ndev, "%s: block %pM\n", __func__, addr);
 		ret = sprdwl_set_blacklist(priv, vif->ctx_id,
@@ -538,8 +635,7 @@ static int sprdwl_priv_cmd(struct net_device *ndev, struct ifreq *ifr)
 	} else if (!strncasecmp(command, CMD_BLACKLIST_DISABLE,
 				strlen(CMD_BLACKLIST_DISABLE))) {
 		skip = strlen(CMD_BLACKLIST_DISABLE) + 1;
-		str2mac(command + skip, addr);
-		if (!is_valid_ether_addr(addr))
+		if (str2mac(command + skip, addr) || !is_valid_ether_addr(addr))
 			goto out;
 		wl_ndev_log(L_INFO, ndev, "%s: unblock %pM\n", __func__, addr);
 		ret = sprdwl_set_blacklist(priv, vif->ctx_id,
@@ -547,8 +643,7 @@ static int sprdwl_priv_cmd(struct net_device *ndev, struct ifreq *ifr)
 	} else if (!strncasecmp(command, CMD_ADD_WHITELIST,
 				strlen(CMD_ADD_WHITELIST))) {
 		skip = strlen(CMD_ADD_WHITELIST) + 1;
-		str2mac(command + skip, addr);
-		if (!is_valid_ether_addr(addr))
+		if (str2mac(command + skip, addr) || !is_valid_ether_addr(addr))
 			goto out;
 		wl_ndev_log(L_INFO, ndev, "%s: add whitelist %pM\n", __func__, addr);
 		ret = sprdwl_set_whitelist(priv, vif->ctx_id,
@@ -556,8 +651,7 @@ static int sprdwl_priv_cmd(struct net_device *ndev, struct ifreq *ifr)
 	} else if (!strncasecmp(command, CMD_DEL_WHITELIST,
 				strlen(CMD_DEL_WHITELIST))) {
 		skip = strlen(CMD_DEL_WHITELIST) + 1;
-		str2mac(command + skip, addr);
-		if (!is_valid_ether_addr(addr))
+		if (str2mac(command + skip, addr) || !is_valid_ether_addr(addr))
 			goto out;
 		wl_ndev_log(L_INFO, ndev, "%s: delete whitelist %pM\n", __func__, addr);
 		ret = sprdwl_set_whitelist(priv, vif->ctx_id,
@@ -565,69 +659,13 @@ static int sprdwl_priv_cmd(struct net_device *ndev, struct ifreq *ifr)
 	} else if (!strncasecmp(command, CMD_ENABLE_WHITELIST,
 				strlen(CMD_ENABLE_WHITELIST))) {
 		skip = strlen(CMD_ENABLE_WHITELIST) + 1;
-		counter = command[skip];
-		wl_ndev_log(L_INFO, ndev, "%s: enable whitelist counter : %d\n",
-			    __func__, counter);
-		if (!counter) {
-			ret = sprdwl_set_whitelist(priv, vif->ctx_id,
-						   SPRDWL_SUBCMD_ENABLE,
-						   0, NULL);
-			goto out;
-		}
-		mac_addr = kmalloc(ETH_ALEN * counter, GFP_KERNEL);
-		mac_list = mac_addr;
-		if (IS_ERR(mac_addr)) {
-			ret = -ENOMEM;
-			goto out;
-		}
-
-		tmp = command + skip + 1;
-		for (index = 0; index < counter; index++) {
-			str2mac(tmp, mac_addr);
-			if (!is_valid_ether_addr(mac_addr))
-				goto out;
-			wl_ndev_log(L_INFO, ndev, "%s: enable whitelist %pM\n",
-				    __func__, mac_addr);
-			mac_addr += ETH_ALEN;
-			tmp += 18;
-		}
-		ret = sprdwl_set_whitelist(priv, vif->ctx_id,
-					   SPRDWL_SUBCMD_ENABLE,
-					   counter, mac_list);
-		kfree(mac_list);
+		ret = sprdwl_priv_cmd_whitelist(vif, command, max_len, skip,
+						SPRDWL_SUBCMD_ENABLE);
 	} else if (!strncasecmp(command, CMD_DISABLE_WHITELIST,
 				strlen(CMD_DISABLE_WHITELIST))) {
 		skip = strlen(CMD_DISABLE_WHITELIST) + 1;
-		counter = command[skip];
-		wl_ndev_log(L_INFO, ndev, "%s: disable whitelist counter : %d\n",
-			    __func__, counter);
-		if (!counter) {
-			ret = sprdwl_set_whitelist(priv, vif->ctx_id,
-						   SPRDWL_SUBCMD_DISABLE,
-						   0, NULL);
-			goto out;
-		}
-		mac_addr = kmalloc(ETH_ALEN * counter, GFP_KERNEL);
-		mac_list = mac_addr;
-		if (IS_ERR(mac_addr)) {
-			ret = -ENOMEM;
-			goto out;
-		}
-
-		tmp = command + skip + 1;
-		for (index = 0; index < counter; index++) {
-			str2mac(tmp, mac_addr);
-			if (!is_valid_ether_addr(mac_addr))
-				goto out;
-			wl_ndev_log(L_INFO, ndev, "%s: disable whitelist %pM\n",
-				    __func__, mac_addr);
-			mac_addr += ETH_ALEN;
-			tmp += 18;
-		}
-		ret = sprdwl_set_whitelist(priv, vif->ctx_id,
-					   SPRDWL_SUBCMD_DISABLE,
-					   counter, mac_list);
-		kfree(mac_list);
+		ret = sprdwl_priv_cmd_whitelist(vif, command, max_len, skip,
+						SPRDWL_SUBCMD_DISABLE);
 	} else if (!strncasecmp(command, CMD_11V_GET_CFG,
 				strlen(CMD_11V_GET_CFG))) {
 		/* deflaut CP support all featrue */
@@ -747,7 +785,7 @@ out:
 	return ret;
 }
 
-static int sprdwl_set_power_save(struct net_device *ndev, struct ifreq *ifr)
+static int sprdwl_set_power_save(struct net_device *ndev, void __user *data)
 {
 	struct sprdwl_vif *vif = netdev_priv(ndev);
 	struct sprdwl_priv *priv = vif->priv;
@@ -756,26 +794,15 @@ static int sprdwl_set_power_save(struct net_device *ndev, struct ifreq *ifr)
 	int ret = 0, skip, value;
 	int max_len = 0;
 
-	if (!ifr->ifr_data)
-		return -EINVAL;
-	if (copy_from_user(&priv_cmd, ifr->ifr_data, sizeof(priv_cmd)))
-		return -EFAULT;
-
-	/*add length check to avoid invalid NULL ptr*/
-	if (!priv_cmd.total_len) {
-		wl_ndev_log(L_INFO, ndev, "%s: priv cmd total len is invalid\n", __func__);
-		return -EINVAL;
+	ret = sprdwl_get_priv_cmd(data, &priv_cmd);
+	if (ret) {
+		wl_ndev_log(L_INFO, ndev, "%s: priv cmd is invalid\n", __func__);
+		return ret;
 	}
 
-	/* fix max_len for mv300(total_len = 4096) */
-	max_len = priv_cmd.total_len > MAX_PRIV_CMD_LEN ? MAX_PRIV_CMD_LEN : priv_cmd.total_len;
-	command = kmalloc(max_len, GFP_KERNEL);
-	if (!command)
-		return -ENOMEM;
-	if (copy_from_user(command, priv_cmd.buf, max_len)) {
-		ret = -EFAULT;
-		goto out;
-	}
+	command = sprdwl_get_priv_cmd_buf(&priv_cmd, &max_len);
+	if (IS_ERR(command))
+		return PTR_ERR(command);
 
 	if (!strncasecmp(command, CMD_SETSUSPENDMODE,
 			 strlen(CMD_SETSUSPENDMODE))) {
@@ -806,7 +833,7 @@ out:
 	return ret;
 }
 
-static int sprdwl_set_tlv(struct net_device *ndev, struct ifreq *ifr)
+static int sprdwl_set_tlv(struct net_device *ndev, void __user *data)
 {
 	struct sprdwl_vif *vif = netdev_priv(ndev);
 	struct sprdwl_priv *priv = vif->priv;
@@ -815,24 +842,25 @@ static int sprdwl_set_tlv(struct net_device *ndev, struct ifreq *ifr)
 	int ret;
 	int max_len = 0;
 
-	if (!ifr->ifr_data)
+	ret = sprdwl_get_priv_cmd(data, &priv_cmd);
+	if (ret)
+		return ret;
+
+	/* total_len is a signed int, compare it as such */
+	if (priv_cmd.total_len < (int)sizeof(*tlv))
 		return -EINVAL;
 
-	if (copy_from_user(&priv_cmd, ifr->ifr_data, sizeof(priv_cmd)))
-		return -EFAULT;
+	tlv = (struct sprdwl_tlv_data *)sprdwl_get_priv_cmd_buf(&priv_cmd,
+								 &max_len);
+	if (IS_ERR(tlv))
+		return PTR_ERR(tlv);
 
-	if (priv_cmd.total_len < sizeof(*tlv))
-		return -EINVAL;
-
-	max_len = priv_cmd.total_len > MAX_PRIV_CMD_LEN ? MAX_PRIV_CMD_LEN : priv_cmd.total_len;
-	tlv = kmalloc(max_len, GFP_KERNEL);
-	if (!tlv)
-		return -ENOMEM;
-
-	if (copy_from_user(tlv, priv_cmd.buf, max_len)) {
-		ret = -EFAULT;
+	/* the TLV payload must fit in what was copied from user space */
+	if (tlv->len > max_len - sizeof(*tlv)) {
+		ret = -EINVAL;
 		goto out;
 	}
+
 	/*vowifi case, should send delba*/
 	if (tlv->type == IOCTL_TLV_TP_VOWIFI_INFO &&
 		vif->sm_state == SPRDWL_CONNECTED &&
@@ -895,7 +923,7 @@ static int sprdwl_ioctl(struct net_device *ndev, struct ifreq *req,
 	switch (cmd) {
 	case SPRDWLIOCTL:
 	case SPRDWLSETCOUNTRY:
-		return sprdwl_priv_cmd(ndev, req);
+		return sprdwl_priv_cmd(ndev, data);
 	case SPRDWLGETSSID:
 		if (vif->ssid_len > 0) {
 			if (copy_to_user(wrq->u.essid.pointer, vif->ssid,
@@ -909,9 +937,9 @@ static int sprdwl_ioctl(struct net_device *ndev, struct ifreq *req,
 		break;
 	case SPRDWLSETFCC:
 	case SPRDWLSETSUSPEND:
-		return sprdwl_set_power_save(ndev, req);
+		return sprdwl_set_power_save(ndev, data);
 	case SPRDWLSETTLV:
-		return sprdwl_set_tlv(ndev, req);
+		return sprdwl_set_tlv(ndev, data);
 	default:
 		wl_ndev_log(L_ERR, ndev, "Unsupported IOCTL %d\n", cmd);
 		return -ENOTSUPP;
@@ -1046,6 +1074,32 @@ static struct net_device_ops sprdwl_netdev_ops = {
 	.ndo_set_mac_address = sprdwl_set_mac,
 };
 
+/*
+ * CP2 reset notification. The BSP calls the registered function as
+ * marlin_reset_callback, i.e. int (*)(void *). if_ops->force_exit is
+ * void (*)(void *): registering it directly made the indirect call a
+ * function type mismatch, which is a fatal "CFI failure" with kCFI.
+ */
+static int sprdwl_marlin_reset_notify(void *para)
+{
+	struct sprdwl_priv *priv = g_sprdwl_priv;
+
+	if (!priv || !priv->if_ops || !priv->if_ops->force_exit)
+		return 0;
+#if defined(UWE5621_FTR)
+	priv->if_ops->force_exit(para);
+#else
+	priv->if_ops->force_exit();
+#endif
+	return 0;
+}
+
+/* true if @ndev was created by this driver (netdev_priv is a sprdwl_vif) */
+bool sprdwl_is_sprdwl_netdev(const struct net_device *ndev)
+{
+	return ndev && ndev->netdev_ops == &sprdwl_netdev_ops;
+}
+
 static int sprdwl_inetaddr_event(struct notifier_block *this,
 				 unsigned long event, void *ptr)
 {
@@ -1147,7 +1201,8 @@ static int write_mac_addr(char *mac_file, u8 *addr)
 	char buf[18];
 	loff_t pos = 0;
 	/*open file*/
-	fp = filp_open(mac_file, O_CREAT|O_RDWR, 777);
+	/* the mode is octal: the old decimal 777 meant 01411 */
+	fp = filp_open(mac_file, O_CREAT|O_RDWR, 0644);
 	if (IS_ERR(fp)) {
 		 wl_err("can't create WIFI MAC file!\n");
 		 return -ENOENT;
@@ -1196,12 +1251,12 @@ static int sprdwl_get_mac_from_file(struct sprdwl_vif *vif, u8 *addr)
 	 * get_fs()/set_fs(KERNEL_DS) override is needed (set_fs() was
 	 * removed in Linux 5.10).
 	 */
-	kernel_read(fp, buf, sizeof(buf), pos);
+	/* keep the last byte of buf as NUL terminator for str2mac() */
+	kernel_read(fp, buf, sizeof(buf) - 1, pos);
 
 	filp_close(fp, NULL);
 
-	str2mac(buf, addr);
-	if (!is_valid_ether_addr(addr)) {
+	if (str2mac(buf, addr) || !is_valid_ether_addr(addr)) {
 		wl_ndev_log(L_ERR, vif->ndev, "%s invalid MAC address (%pM)\n",
 				 __func__, addr);
 		return -EINVAL;
@@ -1805,7 +1860,8 @@ int sprdwl_core_init(struct device *dev, struct sprdwl_priv *priv)
 
 	trace_info_init();
 
-	ret = marlin_reset_register_notify(priv->if_ops->force_exit, priv->hw_priv);
+	ret = marlin_reset_register_notify(sprdwl_marlin_reset_notify,
+					   priv->hw_priv);
 	if (ret) {
 		wl_err("%s failed to register wcn cp rest notify(%d)!\n",
 		       __func__, ret);

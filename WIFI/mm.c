@@ -106,15 +106,21 @@ static inline struct sk_buff *mm_build_skb(void *data, int len, int buffer_type)
 }
 
 static struct sk_buff
-*mm_data2skb_process(struct sprdwl_mm *mm_entry, void *data, int len)
+*mm_data2skb_copy(void *data, int alloc_len, int copy_len)
 {
 	struct sk_buff *skb = NULL;
 
-	skb = dev_alloc_skb(len);
+	skb = dev_alloc_skb(alloc_len);
 	if (likely(skb))
-		memcpy(skb->data, data, len);
+		memcpy(skb->data, data, min(copy_len, alloc_len));
 
 	return skb;
+}
+
+static struct sk_buff
+*mm_data2skb_process(struct sprdwl_mm *mm_entry, void *data, int len)
+{
+	return mm_data2skb_copy(data, len, len);
 }
 
 static inline void mm_flush_buffer(struct sprdwl_mm *mm_entry)
@@ -454,6 +460,15 @@ static void mm_normal_data_process(struct sprdwl_mm *mm_entry,
 		wl_err("%s: data len is %d, too short\n",
 		       __func__, len);
 		free_data = true;
+	} else if (unlikely(msdu_total_len(msdu_desc) > len)) {
+		/*
+		 * @len is the payload length after the hif header: an MSDU
+		 * claiming more than that would make the copy below read
+		 * past the receive buffer.
+		 */
+		wl_err("%s: msdu len %d > data len %d\n",
+		       __func__, msdu_total_len(msdu_desc), len);
+		free_data = true;
 	} else {
 		csum = get_sdio_data_csum((void *)rx_if->intf, data);
 		skb_len = SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) +
@@ -472,12 +487,21 @@ static void mm_normal_data_process(struct sprdwl_mm *mm_entry,
 				/* Should not happen */
 				wl_err("%s: data len is %d, skb need %d\n",
 						__func__, len, skb_len);
-				skb = mm_data2skb_process(mm_entry, data,
-						SKB_WITH_OVERHEAD(skb_len));
+				skb = mm_data2skb_copy(data,
+						SKB_WITH_OVERHEAD(skb_len),
+						msdu_total_len(msdu_desc) +
+						mm_entry->hif_offset);
 				free_data = true;
 			}
 		} else {
-			skb = mm_data2skb_process(mm_entry, data, SKB_WITH_OVERHEAD(skb_len));
+			/*
+			 * SDMA (the default RX mode) copies every packet:
+			 * copy only the hif header and the MSDU, not the
+			 * padding up to SKB_WITH_OVERHEAD(skb_len).
+			 */
+			skb = mm_data2skb_copy(data, SKB_WITH_OVERHEAD(skb_len),
+					       msdu_total_len(msdu_desc) +
+					       mm_entry->hif_offset);
 			free_data = true;
 		}
 

@@ -62,8 +62,7 @@ sprdbt_tty-objs := \
 	debug.o \
 	sdio.o \
 	sitm.o \
-	hci.o \
-	debug.o
+	hci.o
 
 obj-m += sprdbt_tty.o
 

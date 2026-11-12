@@ -751,8 +751,9 @@ static ssize_t mdbg_proc_write(struct file *filp,
 		stop_marlin(MARLIN_WIFI);
 
 #endif
-	if (count > MDBG_WRITE_SIZE) {
-		WCN_ERR("mdbg_proc_write count > MDBG_WRITE_SIZE\n");
+	/* keep room for the NUL terminator: write_buf is used as a string */
+	if (count >= MDBG_WRITE_SIZE) {
+		WCN_ERR("mdbg_proc_write count >= MDBG_WRITE_SIZE\n");
 		return -ENOMEM;
 	}
 	memset(mdbg_proc->write_buf, 0, MDBG_WRITE_SIZE);
@@ -829,9 +830,13 @@ static ssize_t mdbg_proc_write(struct file *filp,
 
 	if (strncmp(mdbg_proc->write_buf, "logpath=",
 		strlen("logpath=")) == 0) {
-		unsigned int path_len = count - strlen("logpath=") - 1;
+		unsigned int path_len;
 
-		if (strstr(mdbg_proc->write_buf, "\r"))
+		/* "logpath=" + at least one character + '\n' */
+		if (count < strlen("logpath=") + 2)
+			return -EINVAL;
+		path_len = count - strlen("logpath=") - 1;
+		if (strstr(mdbg_proc->write_buf, "\r") && path_len > 1)
 			path_len--;
 		if (wcn_set_log_file_path(mdbg_proc->write_buf + 8,
 			path_len)) {

@@ -1104,12 +1104,12 @@ int sprdwl_fw_power_down_ack(struct sprdwl_priv *priv, u8 ctx_id);
 int sprdwl_cmd_host_wakeup_fw(struct sprdwl_priv *priv, u8 ctx_id);
 void sprdwl_work_host_wakeup_fw(struct sprdwl_vif *vif);
 struct sprdwl_msg_buf *__sprdwl_cmd_getbuf(struct sprdwl_priv *priv,
-					   u16 len, u8 ctx_id,
+					   unsigned int len, u8 ctx_id,
 					   enum sprdwl_head_rsp rsp,
 					   u8 cmd_id, gfp_t flags);
 
 static inline struct sprdwl_msg_buf *sprdwl_cmd_getbuf(struct sprdwl_priv *priv,
-						       u16 len, u8 ctx_id,
+						       unsigned int len, u8 ctx_id,
 						       enum sprdwl_head_rsp rsp,
 						       u8 cmd_id)
 {
@@ -1118,7 +1118,7 @@ static inline struct sprdwl_msg_buf *sprdwl_cmd_getbuf(struct sprdwl_priv *priv,
 
 static inline struct
 sprdwl_msg_buf *sprdwl_cmd_getbuf_atomic(struct sprdwl_priv *priv,
-					 u16 len, u8 ctx_id,
+					 unsigned int len, u8 ctx_id,
 					 enum sprdwl_head_rsp rsp,
 					 u8 cmd_id)
 {

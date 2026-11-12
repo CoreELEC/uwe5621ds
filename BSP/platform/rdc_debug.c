@@ -373,33 +373,43 @@ int wcn_set_log_file_path(char *path, unsigned int path_len)
 	char wcn_cp2_mem_path_user_tmp[WCN_DEBUG_MAX_PATH_LEN] = {0};
 	char wcn_cp2_log_path_user[WCN_DEBUG_MAX_PATH_LEN] = {0};
 	char wcn_cp2_mem_path_user[WCN_DEBUG_MAX_PATH_LEN] = {0};
-	char log_name[] = WCN_CP2_LOG_NAME;
-	char mem_name[] = WCN_CP2_MEM_NAME;
 	char wcn_cp2_log_num_user;
 	char wcn_cp2_mem_num_user;
 	loff_t wcn_cp2_log_pos_user = 0;
 	struct file *filp;
 
-	/* 10 is the len of 0xFFFFFFFF to decimal num*/
-	if (path_len > (WCN_DEBUG_MAX_PATH_LEN - 10)) {
-		WCN_ERR("%s: log path is too long:%d", __func__, path_len);
+	/*
+	 * The path comes from user space (mdbg proc "logpath="). It used
+	 * to be passed to sprintf() as the format string, and the result
+	 * is used as a format again below: refuse '%' in it. The file name
+	 * appended to it (plus 10 digits for the number) must also fit,
+	 * which the old check did not ensure.
+	 */
+	if (!path_len || path_len > (WCN_DEBUG_MAX_PATH_LEN - 10 -
+				      sizeof(WCN_CP2_LOG_NAME))) {
+		WCN_ERR("%s: invalid log path length:%d", __func__, path_len);
+		return -1;
+	}
+	if (memchr(path, '%', path_len)) {
+		WCN_ERR("%s: invalid character in log path\n", __func__);
 		return -1;
 	}
 
-	sprintf(wcn_cp2_log_path_user_tmp, path);
-	sprintf(wcn_cp2_log_path_user_tmp + path_len, log_name);
-	sprintf(wcn_cp2_mem_path_user_tmp, path);
-	sprintf(wcn_cp2_mem_path_user_tmp + path_len, mem_name);
+	/* WCN_CP2_*_NAME contain "%%d": as a format they produce "%d" */
+	snprintf(wcn_cp2_log_path_user_tmp, sizeof(wcn_cp2_log_path_user_tmp),
+		 "%.*s" WCN_CP2_LOG_NAME, (int)path_len, path);
+	snprintf(wcn_cp2_mem_path_user_tmp, sizeof(wcn_cp2_mem_path_user_tmp),
+		 "%.*s" WCN_CP2_MEM_NAME, (int)path_len, path);
 
 	wcn_cp2_log_num_user =
 		wcn_find_cp2_file_num(wcn_cp2_log_path_user_tmp,
 			&wcn_cp2_log_pos_user);
-	sprintf(wcn_cp2_log_path_user, wcn_cp2_log_path_user_tmp,
-		wcn_cp2_log_num_user);
+	snprintf(wcn_cp2_log_path_user, sizeof(wcn_cp2_log_path_user),
+		 wcn_cp2_log_path_user_tmp, wcn_cp2_log_num_user);
 
 	wcn_cp2_mem_num_user = 0; //only one mem_dump file
-	sprintf(wcn_cp2_mem_path_user,
-		wcn_cp2_mem_path_user_tmp, wcn_cp2_mem_num_user);
+	snprintf(wcn_cp2_mem_path_user, sizeof(wcn_cp2_mem_path_user),
+		 wcn_cp2_mem_path_user_tmp, wcn_cp2_mem_num_user);
 
 	//check if the new path is valid.
 	filp = filp_open(wcn_cp2_log_path_user,

@@ -821,7 +821,19 @@ static int sprdwl_vendor_gscan_start(struct wiphy *wiphy,
 	wl_ndev_log(L_INFO, vif->ndev, "parse config %s\n",
 		    !ret ? "success" : "failture");
 
+	/*
+	 * num_buckets and num_channels come from user space but index
+	 * fixed size arrays (buckets[MAX_BUCKETS], channels[MAX_CHANNELS])
+	 * below and in the firmware command.
+	 */
+	if (params->num_buckets > MAX_BUCKETS)
+		params->num_buckets = MAX_BUCKETS;
+	for (i = 0; i < params->num_buckets; i++)
+		if (params->buckets[i].num_channels > MAX_CHANNELS)
+			params->buckets[i].num_channels = MAX_CHANNELS;
+
 	kfree(vif->priv->gscan_res);
+	vif->priv->gscan_res = NULL;
 	vif->priv->gscan_buckets_num = params->num_buckets;
 	tlen = sizeof(struct sprdwl_gscan_cached_results);
 
@@ -831,6 +843,7 @@ static int sprdwl_vendor_gscan_start(struct wiphy *wiphy,
 				GFP_KERNEL);
 
 	if (!vif->priv->gscan_res) {
+		vif->priv->gscan_buckets_num = 0;
 		kfree(params);
 		return -ENOMEM;
 	}
@@ -864,8 +877,12 @@ static int sprdwl_vendor_gscan_start(struct wiphy *wiphy,
 			sizeof(int), (u8 *)(&rsp), &rlen);
 	}
 
-	if (ret < 0)
+	if (ret < 0) {
+		/* the RX path dereferences gscan_res, do not leave it dangling */
 		kfree(vif->priv->gscan_res);
+		vif->priv->gscan_res = NULL;
+		vif->priv->gscan_buckets_num = 0;
+	}
 	kfree(params);
 
 	return ret;
@@ -1141,18 +1158,23 @@ static int sprdwl_vendor_get_cached_gscan_results(struct wiphy *wiphy,
 		if (!(vif->priv->gscan_res + i)->num_results)
 			continue;
 
-		for (j = 0; j <= (vif->priv->gscan_res + i)->num_results; j++) {
+		/*
+		 * Drop expired entries. This used to run to j == num_results,
+		 * where "num_results - j - 1" is -1 and the memcpy() size
+		 * becomes huge; the regions also overlap (memmove).
+		 */
+		for (j = 0; j < (vif->priv->gscan_res + i)->num_results;) {
+			struct sprdwl_gscan_cached_results *p =
+				vif->priv->gscan_res + i;
+
 			if (time_after(jiffies - VENDOR_SCAN_RESULT_EXPIRE,
-				(vif->priv->gscan_res + i)->results[j].ts)) {
-				memcpy((void *)
-				(&(vif->priv->gscan_res + i)->results[j]),
-				(void *)
-				(&(vif->priv->gscan_res + i)->results[j + 1]),
-				sizeof(struct sprdwl_gscan_result)
-				* ((vif->priv->gscan_res + i)->num_results
-				- j - 1));
-				(vif->priv->gscan_res + i)->num_results--;
-				j = 0;
+				       p->results[j].ts)) {
+				memmove(&p->results[j], &p->results[j + 1],
+					sizeof(struct sprdwl_gscan_result) *
+					(p->num_results - j - 1));
+				p->num_results--;
+			} else {
+				j++;
 			}
 		}
 
@@ -1327,9 +1349,10 @@ int sprdwl_vendor_cache_scan_result(struct sprdwl_vif *vif,
 		return -EINVAL;
 	}
 	for (i = 0; i < priv->gscan_buckets_num; i++) {
-		p = priv->gscan_res + i;
-		if (p->scan_id == bucket_id)
+		if (priv->gscan_res[i].scan_id == bucket_id) {
+			p = priv->gscan_res + i;
 			break;
+		}
 	}
 	if (!p) {
 		wl_ndev_log(L_ERR, vif->ndev, "%s the bucket isnot exsit.\n", __func__);
@@ -1342,15 +1365,17 @@ int sprdwl_vendor_cache_scan_result(struct sprdwl_vif *vif,
 	}
 
 	for (i = 0; i < p->num_results; i++) {
-		if (time_after(jiffies - VENDOR_SCAN_RESULT_EXPIRE,
-			       p->results[i].ts)) {
-			memcpy((void *)(&p->results[i]),
-			       (void *)(&p->results[i+1]),
-				sizeof(struct sprdwl_gscan_result)
-				* (p->num_results - i - 1));
-
+		/* drop expired entries (overlapping regions: memmove) */
+		while (i < p->num_results &&
+		       time_after(jiffies - VENDOR_SCAN_RESULT_EXPIRE,
+				  p->results[i].ts)) {
+			memmove(&p->results[i], &p->results[i + 1],
+				sizeof(struct sprdwl_gscan_result) *
+				(p->num_results - i - 1));
 			p->num_results--;
 		}
+		if (i >= p->num_results)
+			break;
 
 		if (!memcmp(p->results[i].bssid, item->bssid, ETH_ALEN) &&
 		    strlen(p->results[i].ssid) == strlen(item->ssid) &&
@@ -1393,15 +1418,17 @@ int sprdwl_vendor_cache_hotlist_result(struct sprdwl_vif *vif,
 	}
 
 	for (i = 0; i < p->num_results; i++) {
-		if (time_after(jiffies - VENDOR_SCAN_RESULT_EXPIRE,
-			       p->results[i].ts)) {
-			memcpy((void *)(&p->results[i]),
-			       (void *)(&p->results[i+1]),
-				sizeof(struct sprdwl_gscan_result)
-				* (p->num_results - i - 1));
-
+		/* drop expired entries (overlapping regions: memmove) */
+		while (i < p->num_results &&
+		       time_after(jiffies - VENDOR_SCAN_RESULT_EXPIRE,
+				  p->results[i].ts)) {
+			memmove(&p->results[i], &p->results[i + 1],
+				sizeof(struct sprdwl_gscan_result) *
+				(p->num_results - i - 1));
 			p->num_results--;
 		}
+		if (i >= p->num_results)
+			break;
 
 		if (!memcmp(p->results[i].bssid, item->bssid, ETH_ALEN) &&
 		    strlen(p->results[i].ssid) == strlen(item->ssid) &&
@@ -1450,6 +1477,12 @@ int sprdwl_vendor_cache_significant_change_result(struct sprdwl_vif *vif,
 			wl_ndev_log(L_ERR, vif->ndev,
 				   "%s invalid available length: %d!\n",
 				   __func__, avail_len);
+			break;
+		}
+
+		if (p->num_results >= MAX_SIGNIFICANT_CHANGE_APS) {
+			wl_ndev_log(L_ERR, vif->ndev, "%s too many results\n",
+				    __func__);
 			break;
 		}
 
@@ -1584,6 +1617,9 @@ void sprdwl_report_gscan_result(struct sprdwl_vif *vif,
 		wl_ndev_log(L_ERR, vif->ndev, "%s NULL frame!\n", __func__);
 		return;
 	}
+	/* ielen is size_t: a short frame would make it wrap */
+	if (len < offsetof(struct ieee80211_mgmt, u.probe_resp.variable))
+		return;
 	ie = mgmt->u.probe_resp.variable;
 	ielen = len - offsetof(struct ieee80211_mgmt, u.probe_resp.variable);
 	/*tsf = le64_to_cpu(mgmt->u.probe_resp.timestamp);*/
@@ -1768,11 +1804,13 @@ static int sprdwl_vendor_set_bssid_hotlist(struct wiphy *wiphy,
 	u16 rlen = sizeof(struct sprdwl_cmd_gscan_rsp_header);
 
 	bssid_hotlist_params =
-		kmalloc(sizeof(*bssid_hotlist_params), GFP_KERNEL);
+		kzalloc(sizeof(*bssid_hotlist_params), GFP_KERNEL);
 
 	if (!bssid_hotlist_params)
 		return -ENOMEM;
 
+	/* a previous configuration must not be leaked */
+	kfree(vif->priv->hotlist_res);
 	vif->priv->hotlist_res =
 			kmalloc(sizeof(struct sprdwl_gscan_hotlist_results),
 				GFP_KERNEL);
@@ -1810,9 +1848,9 @@ static int sprdwl_vendor_set_bssid_hotlist(struct wiphy *wiphy,
 					type = nla_type(inner_iter);
 					switch (type) {
 					case GSCAN_ATTR_AP_THR_PARAM_BSSID:
-					    memcpy(
+					    nla_memcpy(
 					    bssid_hotlist_params->ap[i].bssid,
-					    nla_data(inner_iter),
+					    inner_iter,
 					    6 * sizeof(unsigned char));
 					break;
 
@@ -1865,8 +1903,11 @@ static int sprdwl_vendor_set_bssid_hotlist(struct wiphy *wiphy,
 				SPRDWL_GSCAN_SUBCMD_SET_HOTLIST,
 				tlen, (u8 *)(&rsp), &rlen);
 
-	if (ret < 0)
+	if (ret < 0) {
+		/* the RX path dereferences hotlist_res: no dangling pointer */
 		kfree(vif->priv->hotlist_res);
+		vif->priv->hotlist_res = NULL;
+	}
 
 out:
 	kfree(bssid_hotlist_params);
@@ -1885,8 +1926,9 @@ static int sprdwl_vendor_reset_bssid_hotlist(struct wiphy *wiphy,
 
 	wl_ndev_log(L_INFO, vif->ndev, "%s %d\n", __func__, flush);
 
-	memset(vif->priv->hotlist_res, 0x0,
-		sizeof(struct sprdwl_gscan_hotlist_results));
+	if (vif->priv->hotlist_res)
+		memset(vif->priv->hotlist_res, 0x0,
+		       sizeof(struct sprdwl_gscan_hotlist_results));
 
 	return sprdwl_gscan_subcmd(vif->priv, vif->ctx_id,
 					(void *)(&flush),
@@ -1909,11 +1951,13 @@ static int sprdwl_vendor_set_significant_change(struct wiphy *wiphy,
 	u16 rlen = sizeof(struct sprdwl_cmd_gscan_rsp_header);
 
 	significant_change_params =
-		kmalloc(sizeof(*significant_change_params), GFP_KERNEL);
+		kzalloc(sizeof(*significant_change_params), GFP_KERNEL);
 
 	if (!significant_change_params)
 		return -ENOMEM;
 
+	/* a previous configuration must not be leaked */
+	kfree(vif->priv->significant_res);
 	vif->priv->significant_res =
 			kmalloc(sizeof(struct sprdwl_significant_change_result),
 				GFP_KERNEL);
@@ -1962,9 +2006,9 @@ static int sprdwl_vendor_set_significant_change(struct wiphy *wiphy,
 				type = nla_type(inner_iter);
 				switch (type) {
 				case GSCAN_ATTR_AP_THR_PARAM_BSSID:
-					memcpy(
+					nla_memcpy(
 					significant_change_params->ap[i].bssid,
-					nla_data(inner_iter),
+					inner_iter,
 					6 * sizeof(unsigned char));
 				break;
 
@@ -2012,8 +2056,11 @@ static int sprdwl_vendor_set_significant_change(struct wiphy *wiphy,
 			SPRDWL_GSCAN_SUBCMD_SET_SIGNIFICANT_CHANGE_CONFIG,
 			tlen, (u8 *)(&rsp), &rlen);
 
-	if (ret < 0)
+	if (ret < 0) {
+		/* the RX path dereferences significant_res */
 		kfree(vif->priv->significant_res);
+		vif->priv->significant_res = NULL;
+	}
 
 out:
 	kfree(significant_change_params);
@@ -2233,7 +2280,7 @@ static int sprdwl_vendor_set_mac_oui(struct wiphy *wiphy,
 		type = nla_type(pos);
 		switch (type) {
 		case WLAN_VENDOR_ATTR_SET_SCANNING_MAC_OUI:
-			memcpy(rand_mac, nla_data(pos), 3);
+			nla_memcpy(rand_mac, pos, 3);
 		break;
 
 		default:
@@ -2663,6 +2710,13 @@ static int sprdwl_vendor_set_roam_params(struct wiphy *wiphy,
 		i = 0;
 		nla_for_each_nested(curr_attr,
 				    tb[SPRDWL_ROAM_SET_BSSID_PARAMS], rem) {
+			/*
+			 * The nested list may hold more entries than
+			 * num_black_bssid claims: never write past
+			 * black_params.black_list[] (on the stack).
+			 */
+			if (i >= black_limit)
+				break;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 			if (nla_parse(tb2, SPRDWL_ROAM_MAX,
 				      nla_data(curr_attr), nla_len(curr_attr),
@@ -2717,7 +2771,7 @@ static int sprdwl_vendor_set_ssid_hotlist(struct wiphy *wiphy,
 	u16 rlen = sizeof(struct sprdwl_cmd_gscan_rsp_header);
 
 	ssid_hotlist_params =
-		kmalloc(sizeof(*ssid_hotlist_params), GFP_KERNEL);
+		kzalloc(sizeof(*ssid_hotlist_params), GFP_KERNEL);
 
 	if (!ssid_hotlist_params)
 		return -ENOMEM;
@@ -2747,9 +2801,9 @@ static int sprdwl_vendor_set_ssid_hotlist(struct wiphy *wiphy,
 					type = nla_type(inner_iter);
 				switch (type) {
 				case GSCAN_ATTR_GSCAN_SSID_THR_PARAM_SSID:
-				memcpy(
+				nla_memcpy(
 				ssid_hotlist_params->ssid[i].ssid,
-				nla_data(inner_iter),
+				inner_iter,
 				IEEE80211_MAX_SSID_LEN * sizeof(unsigned char));
 				break;
 
@@ -2849,7 +2903,7 @@ static int sprdwl_vendor_set_passpoint_list(struct wiphy *wiphy,
 		return -EINVAL;
 	}
 
-	HS_list_params = kmalloc(sizeof(*HS_list_params), GFP_KERNEL);
+	HS_list_params = kzalloc(sizeof(*HS_list_params), GFP_KERNEL);
 	if (!HS_list_params)
 		return -ENOMEM;
 
@@ -2905,8 +2959,9 @@ static int sprdwl_vendor_set_passpoint_list(struct wiphy *wiphy,
 			goto out;
 		}
 
+		/* the attribute checked above is in tb2, not tb */
 		HS_list_params->id =
-			nla_get_u32(tb[GSCAN_ANQPO_HS_NETWORK_ID]);
+			nla_get_u32(tb2[GSCAN_ANQPO_HS_NETWORK_ID]);
 
 		if (!tb2[GSCAN_ANQPO_HS_NAI_REALM]) {
 			wl_ndev_log(L_INFO, vif->ndev,
@@ -2915,9 +2970,8 @@ static int sprdwl_vendor_set_passpoint_list(struct wiphy *wiphy,
 			ret = -EINVAL;
 			goto out;
 		}
-		memcpy(HS_list_params->realm, nla_data(
-			tb2[GSCAN_ANQPO_HS_NAI_REALM]),
-			256);
+		nla_memcpy(HS_list_params->realm,
+			   tb2[GSCAN_ANQPO_HS_NAI_REALM], 256);
 
 		if (!tb2[GSCAN_ANQPO_HS_ROAM_CONSORTIUM_ID]) {
 			wl_ndev_log(L_INFO, vif->ndev,
@@ -2927,9 +2981,8 @@ static int sprdwl_vendor_set_passpoint_list(struct wiphy *wiphy,
 			goto out;
 		}
 
-		memcpy(HS_list_params->roaming_ids, nla_data(
-			tb2[GSCAN_ANQPO_HS_ROAM_CONSORTIUM_ID]),
-			128);
+		nla_memcpy(HS_list_params->roaming_ids,
+			   tb2[GSCAN_ANQPO_HS_ROAM_CONSORTIUM_ID], 128);
 
 		if (!tb2[GSCAN_ANQPO_HS_PLMN]) {
 			wl_ndev_log(L_INFO, vif->ndev,
@@ -2939,9 +2992,8 @@ static int sprdwl_vendor_set_passpoint_list(struct wiphy *wiphy,
 			goto out;
 		}
 
-		memcpy(HS_list_params->plmn, nla_data(
-			tb2[GSCAN_ANQPO_HS_PLMN]),
-			3);
+		nla_memcpy(HS_list_params->plmn,
+			   tb2[GSCAN_ANQPO_HS_PLMN], 3);
 		i++;
 	}
 
@@ -3176,6 +3228,9 @@ static int sprdwl_vendor_set_epno_list(struct wiphy *wiphy,
 	struct sprdwl_vif *vif = netdev_priv(wdev->netdev);
 	u16 rlen = sizeof(struct sprdwl_cmd_gscan_rsp_header);
 
+	/* sent to the firmware as is: no uninitialized stack data */
+	memset(&epno_params, 0, sizeof(epno_params));
+
 	nla_for_each_attr(pos, (void *)data, len, rem_len) {
 		type = nla_type(pos);
 		switch (type) {
@@ -3227,9 +3282,9 @@ static int sprdwl_vendor_set_epno_list(struct wiphy *wiphy,
 					type = nla_type(inner_iter);
 					switch (type) {
 					case SPRDWL_EPNO_PARAM_NETWORK_SSID:
-						memcpy(epno_network->ssid,
-						       nla_data(inner_iter),
-						       IEEE80211_MAX_SSID_LEN);
+						nla_memcpy(epno_network->ssid,
+							   inner_iter,
+							   IEEE80211_MAX_SSID_LEN);
 						break;
 
 					case SPRDWL_EPNO_PARAM_NETWORK_FLAGS:
@@ -3295,6 +3350,8 @@ int sprdwl_hotlist_change_event(struct sprdwl_vif *vif, u32 report_event)
 	int ret = 0, j, moredata = 0;
 	struct nlattr *cached_list;
 
+	if (!priv->hotlist_res)
+		return -EINVAL;
 
 	rlen = priv->hotlist_res->num_results
 			* sizeof(struct sprdwl_gscan_result) + sizeof(u32);
@@ -3439,6 +3496,10 @@ int sprdwl_significant_change_event(struct sprdwl_vif *vif)
 	int payload, rlen;
 	int ret = 0, j;
 	struct nlattr *cached_list;
+
+	/* triggered by a firmware event, possibly before any config */
+	if (!priv->significant_res)
+		return -EINVAL;
 
 	rlen = sizeof(struct sprdwl_significant_change_result);
 	payload = rlen + 0x100;

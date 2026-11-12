@@ -82,7 +82,12 @@ extern void mmc_power_up(struct mmc_host *host, u32 ocr);
 extern void mmc_power_off(struct mmc_host *host);
 #endif
 
-static int (*scan_card_notify)(void);
+/*
+ * Must match the type of the registered callback (marlin_scan_finish()
+ * is void (void)): with kCFI an indirect call through a pointer of a
+ * different function type is a fatal "CFI failure".
+ */
+static void (*scan_card_notify)(void);
 struct sdiohal_data_t *sdiohal_data;
 static struct sdio_driver sdiohal_driver;
 
@@ -257,7 +262,6 @@ int sdiohal_sdio_pt_write(unsigned char *src, unsigned int datalen)
 	static long time_total_ns;
 	static int times_count;
 
-	ktime_t kt;
 	u32 sec;
 
 	wcn_getnstimeofday(&tm_begin);
@@ -274,12 +278,12 @@ int sdiohal_sdio_pt_write(unsigned char *src, unsigned int datalen)
 	if (sdiohal_card_lock(p_data, __func__))
 		return -1;
 
-	kt = ktime_get();
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
-	sec = (u32)(div_u64(kt, NSEC_PER_SEC));
-#else/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
-	sec = (u32)(div_u64(kt.tv64, NSEC_PER_SEC));
-#endif/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
+	/*
+	 * Per-packet throughput accounting: only the second is needed,
+	 * ktime_get_seconds() gives it without a clocksource read
+	 * and a 64-bit division.
+	 */
+	sec = (u32)ktime_get_seconds();
 	p_data->throughtput_tx.bytes += datalen;
 	if (p_data->throughtput_tx.sec != sec) {
 		p_data->throughtput_tx.throughtput = (p_data->throughtput_tx.bytes * 8) >> 10;
@@ -373,7 +377,6 @@ static int sdiohal_config_packer_chain(struct sdiohal_list_t *data_list,
 	unsigned int i, ttl_len = 0, node_num;
 	int err_ret = 0;
 
-	ktime_t kt;
 	u32 sec;
 
 	node_num = data_list->node_num;
@@ -453,12 +456,12 @@ static int sdiohal_config_packer_chain(struct sdiohal_list_t *data_list,
 	sdiohal_debug("ttl len:%d sg_count:%d\n", ttl_len, sg_count);
 
 	if (dir == SDIOHAL_WRITE) {
-		kt = ktime_get();
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
-		sec = (u32)(div_u64(kt, NSEC_PER_SEC));
-#else/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
-		sec = (u32)(div_u64(kt.tv64, NSEC_PER_SEC));
-#endif/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
+		/*
+		 * Per-packet throughput accounting: only the second is needed,
+		 * ktime_get_seconds() gives it without a clocksource read
+		 * and a 64-bit division.
+		 */
+		sec = (u32)ktime_get_seconds();
 		p_data->throughtput_tx.bytes += ttl_len;
 		if (p_data->throughtput_tx.sec != sec) {
 			p_data->throughtput_tx.throughtput = (p_data->throughtput_tx.bytes * 8) >> 10;

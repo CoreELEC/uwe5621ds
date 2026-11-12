@@ -79,7 +79,6 @@ static int sdiohal_rx_list_parser(struct sdiohal_list_t *data_list,
 	int inout = 0, channel = 0;
 	unsigned int parse_len;
 
-	ktime_t kt;
 	u32 sec;
 
 	sdiohal_list_check(data_list, __func__, SDIOHAL_READ);
@@ -107,12 +106,12 @@ static int sdiohal_rx_list_parser(struct sdiohal_list_t *data_list,
 				continue;
 			}
 
-			kt = ktime_get();
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
-			sec = (u32)(div_u64(kt, NSEC_PER_SEC));
-#else/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
-			sec = (u32)(div_u64(kt.tv64, NSEC_PER_SEC));
-#endif/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
+			/*
+			 * Per-packet throughput accounting: only the second is needed,
+			 * ktime_get_seconds() gives it without a clocksource read
+			 * and a 64-bit division.
+			 */
+			sec = (u32)ktime_get_seconds();
 			p_data->throughtput_rx.bytes += puh->len;
 			if (p_data->throughtput_rx.sec != sec) {
 				p_data->throughtput_rx.throughtput = (p_data->throughtput_rx.bytes * 8) >> 10;
@@ -149,7 +148,6 @@ static int sdiohal_rx_buf_parser(char *data_buf, int valid_len)
 	unsigned char *p = NULL;
 	unsigned int parse_len;
 
-	ktime_t kt;
 	u32 sec;
 
 	puh = (struct sdio_puh_t *)data_buf;
@@ -170,15 +168,22 @@ static int sdiohal_rx_buf_parser(char *data_buf, int valid_len)
 				sdiohal_err("%s skip type[%d]sub[%d]len[%d]\n",
 					    __func__, puh->type, puh->subtype,
 					    puh->len);
-				continue;
+				/*
+				 * "continue" re-parsed the same header without
+				 * advancing: with len == 0 that spun forever in
+				 * the RX thread, and with check_sum set it kept
+				 * growing puh->len. The position of the next
+				 * packet cannot be trusted, drop the rest.
+				 */
+				break;
 			}
 
-			kt = ktime_get();
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
-			sec = (u32)(div_u64(kt, NSEC_PER_SEC));
-#else/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
-			sec = (u32)(div_u64(kt.tv64, NSEC_PER_SEC));
-#endif/*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)*/
+			/*
+			 * Per-packet throughput accounting: only the second is needed,
+			 * ktime_get_seconds() gives it without a clocksource read
+			 * and a 64-bit division.
+			 */
+			sec = (u32)ktime_get_seconds();
 			p_data->throughtput_rx.bytes += puh->len;
 			if (p_data->throughtput_rx.sec != sec) {
 				p_data->throughtput_rx.throughtput = (p_data->throughtput_rx.bytes * 8) >> 10;

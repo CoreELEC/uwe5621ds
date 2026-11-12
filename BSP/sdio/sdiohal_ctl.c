@@ -831,8 +831,9 @@ static ssize_t at_cmd_write(struct file *filp,
 	long int reg_addr_read;
 	unsigned int reg_addr, reg_val;
 
-	if (count > SDIOHAL_WRITE_SIZE) {
-		sdiohal_err("%s write size > %d\n",
+	/* keep the last byte of cmd_buf as NUL terminator */
+	if (count >= SDIOHAL_WRITE_SIZE) {
+		sdiohal_err("%s write size >= %d\n",
 			__func__, SDIOHAL_WRITE_SIZE);
 		return -ENOMEM;
 	}

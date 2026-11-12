@@ -736,6 +736,19 @@ static int sprdwl_cfg80211_add_key(struct wiphy *wiphy, struct net_device *ndev,
 {
 	struct sprdwl_vif *vif = netdev_priv(ndev);
 
+	/*
+	 * IGTKs use key index 4/5, which used to be written past
+	 * key[pairwise][3] (aliasing the pairwise key slots). Cipher suites
+	 * unknown to cfg80211 (WLAN_CIPHER_SUITE_PMK) do not get their key
+	 * length validated by cfg80211, so check it here.
+	 */
+	if (key_index >= SPRDWL_NUM_KEY_SLOTS ||
+	    params->key_len > WLAN_MAX_KEY_LEN) {
+		wl_ndev_log(L_ERR, ndev, "%s invalid key index %d / len %d\n",
+			    __func__, key_index, params->key_len);
+		return -EINVAL;
+	}
+
 	vif->key_index[pairwise] = key_index;
 	vif->key_len[pairwise][key_index] = params->key_len;
 	memcpy(vif->key[pairwise][key_index], params->key, params->key_len);
@@ -1875,13 +1888,22 @@ void sprdwl_set_suspend_resume_connect_params(struct cfg80211_connect_params *sm
 	memset(&con->connect_params, 0, sizeof(con->connect_params));
 	memcpy(&con->connect_params, sme, sizeof(con->connect_params));
 
-	if (sme->ie_len > 0) {
+	if (sme->ie_len > sizeof(con->ie)) {
+		/* cannot happen with nl80211's limits; never overflow con->ie */
+		wl_err("%s: ie_len %zu too long, not saved\n", __func__,
+		       sme->ie_len);
+		con->connect_params.ie = NULL;
+		con->connect_params.ie_len = 0;
+	} else if (sme->ie_len > 0) {
 		memset(con->ie, 0, sizeof(con->ie));
 		memcpy(con->ie, sme->ie, sme->ie_len);
 		con->connect_params.ie = con->ie;
 	}
 
-	if (sme->key_len) {
+	if (sme->key_len > sizeof(con->key)) {
+		con->connect_params.key = NULL;
+		con->connect_params.key_len = 0;
+	} else if (sme->key_len) {
 		memset(con->key, 0, sizeof(con->key));
 		memcpy(con->key, sme->key, sme->key_len);
 		con->connect_params.key = con->key;
@@ -1915,7 +1937,8 @@ void sprdwl_set_suspend_resume_connect_params(struct cfg80211_connect_params *sm
 
 	if (sme->ssid != NULL) {
 		memset(con->ssid, 0, sizeof(con->ssid));
-		memcpy(con->ssid, sme->ssid, sme->ssid_len);
+		memcpy(con->ssid, sme->ssid,
+		       min_t(size_t, sme->ssid_len, sizeof(con->ssid)));
 		con->connect_params.ssid = con->ssid;
 	}
 }
@@ -1965,7 +1988,8 @@ int sprdwl_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 	if (sme->ie_len > 0) {
 		int i;
 		wl_ndev_log(L_DBG, ndev, "set assoc req ie, len %zx\n", sme->ie_len);
-		for (i = 0; i < sme->ie_len - 6; i++) {
+		/* ie_len is a size_t: "ie_len - 6" wraps for short IE sets */
+		for (i = 0; i + 6 < sme->ie_len; i++) {
 			if (sme->ie[i] == 0xDD &&
 			    sme->ie[i + 2] == 0x40 &&
 			    sme->ie[i + 3] == 0x45 &&
@@ -2245,10 +2269,16 @@ void sprdwl_report_fake_probe(struct wiphy *wiphy, u8 *ie, size_t ielen)
 
 	if (0 == local_mac_ind) {
 		if ((ielen+IEEE80211_MAX_SSID_LEN) < SPRDWL_MAX_IE_LEN) {
-			/*add SSID IE*/
-			ie = ie + *(ie+1) + 2;
+			size_t ssid_ie_len;
+
+			/* the first IE (SSID) is replaced below */
+			if (ielen < 2 || ielen < (size_t)ie[1] + 2)
+				return;
+			ssid_ie_len = ie[1] + 2;
+			/*skip SSID IE*/
+			ie = ie + ssid_ie_len;
 			/*total IE length sub SSID IE;*/
-			ielen = ielen - *(ie+1) - 2;
+			ielen = ielen - ssid_ie_len;
 			/*fill in new SSID element*/
 			*fake_ie = 0;
 			/*set SSID IE length*/
@@ -2358,6 +2388,13 @@ void sprdwl_report_scan_result(struct sprdwl_vif *vif, u16 chan, s16 rssi,
 
 	if (!mgmt) {
 		wl_ndev_log(L_ERR, vif->ndev, "%s NULL frame!\n", __func__);
+		return;
+	}
+
+	/* ielen below is size_t: a short frame would make it wrap */
+	if (len < offsetof(struct ieee80211_mgmt, u.probe_resp.variable)) {
+		wl_ndev_log(L_ERR, vif->ndev, "%s frame too short: %u\n",
+			    __func__, len);
 		return;
 	}
 
@@ -2500,7 +2537,13 @@ void sprdwl_report_connection(struct sprdwl_vif *vif,
 		goto err;
 	}
 
-	if (conn_info->bea_ie_len) {
+	/*
+	 * ielen below is a size_t computed as bea_ie_len minus the fixed
+	 * header: treat a beacon shorter than that header as missing
+	 * instead of letting the length wrap.
+	 */
+	if (conn_info->bea_ie_len >=
+	    offsetof(struct ieee80211_mgmt, u.probe_resp.variable)) {
 		wl_debug("%s channel num:%d\n", __func__, conn_info->channel);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
 		freq = ieee80211_channel_to_frequency(conn_info->channel,
@@ -2789,47 +2832,74 @@ static char p2p_action_name[][32] = {
 #define PUB_ACTION		(0x4)
 #define P2P_ACTION		(0x7f)
 
-#define	PRINT_BUF_LEN		(1 << 10)
-static char print_buf[PRINT_BUF_LEN];
+#define	PRINT_BUF_LEN		(128)
 void sprdwl_cfg80211_dump_frame_prot_info(int send, int freq,
 					  const unsigned char *buf, int len)
 {
 	int idx = 0;
-	int type = ((*buf) & IEEE80211_FCTL_FTYPE) >> 2;
-	int subtype = ((*buf) & IEEE80211_FCTL_STYPE) >> 4;
+	int type, subtype;
 	int action, action_subtype;
-	char *p = print_buf;
+	/*
+	 * Called concurrently from the TX and RX paths, so it must not
+	 * share a static buffer.
+	 */
+	char p[PRINT_BUF_LEN];
 
-	idx += sprintf(p + idx, "[cfg80211] ");
+	/*
+	 * This runs for every received scan result and mgmt frame, but
+	 * its only output is a debug message: skip the formatting work
+	 * unless that message would be printed.
+	 */
+	if (sprdwl_debug_level < L_DBG)
+		return;
+
+	/* need at least frame control + addr1 + addr2 for the output */
+	if (!buf || len < ADDR2_OFFSET + ETH_ALEN)
+		return;
+
+	type = ((*buf) & IEEE80211_FCTL_FTYPE) >> 2;
+	subtype = ((*buf) & IEEE80211_FCTL_STYPE) >> 4;
+
+	idx += scnprintf(p + idx, sizeof(p) - idx, "[cfg80211] ");
 
 	if (send)
-		idx += sprintf(p + idx, "SEND: ");
+		idx += scnprintf(p + idx, sizeof(p) - idx, "SEND: ");
 	else
-		idx += sprintf(p + idx, "RECV: ");
+		idx += scnprintf(p + idx, sizeof(p) - idx, "RECV: ");
 
 	if (type == IEEE80211_FTYPE_MGMT) {
-		idx += sprintf(p + idx, "%dMHz, %s, ",
-			       freq, type_name[subtype]);
+		idx += scnprintf(p + idx, sizeof(p) - idx, "%dMHz, %s, ",
+				 freq, type_name[subtype]);
 	} else {
-		idx += sprintf(p + idx,
-			       "%dMHz, not mgmt frame, type=%d, ", freq, type);
+		idx += scnprintf(p + idx, sizeof(p) - idx,
+				 "%dMHz, not mgmt frame, type=%d, ", freq, type);
 	}
 
-	if (subtype == ACTION_TYPE) {
+	/*
+	 * The action (sub)type bytes come straight from the air: check
+	 * that they are present and clamp the subtype to the name tables
+	 * (the last entry of both is "Reserved").
+	 */
+	if (subtype == ACTION_TYPE && len > ACTION_SUBTYPE_OFFSET) {
 		action = *(buf + MAC_LEN);
 		action_subtype = *(buf + ACTION_SUBTYPE_OFFSET);
-		if (action == PUB_ACTION)
-			idx += sprintf(p + idx, "PUB:%s ",
-				       pub_action_name[action_subtype]);
-		else if (action == P2P_ACTION)
-			idx += sprintf(p + idx, "P2P:%s ",
-				       p2p_action_name[action_subtype]);
-		else
-			idx += sprintf(p + idx, "Unknown ACTION(0x%x)", action);
+		if (action == PUB_ACTION) {
+			if (action_subtype >= ARRAY_SIZE(pub_action_name))
+				action_subtype = ARRAY_SIZE(pub_action_name) - 1;
+			idx += scnprintf(p + idx, sizeof(p) - idx, "PUB:%s ",
+					 pub_action_name[action_subtype]);
+		} else if (action == P2P_ACTION) {
+			if (action_subtype >= ARRAY_SIZE(p2p_action_name))
+				action_subtype = ARRAY_SIZE(p2p_action_name) - 1;
+			idx += scnprintf(p + idx, sizeof(p) - idx, "P2P:%s ",
+					 p2p_action_name[action_subtype]);
+		} else {
+			idx += scnprintf(p + idx, sizeof(p) - idx,
+					 "Unknown ACTION(0x%x)", action);
+		}
 	}
-	p[idx] = '\0';
 
-	wl_debug("%s %pM %pM\n", p, &buf[4], &buf[10]);
+	wl_debug("%s %pM %pM\n", p, &buf[ADDR1_OFFSET], &buf[ADDR2_OFFSET]);
 }
 
 /* P2P related stuff */

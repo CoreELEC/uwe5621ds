@@ -77,11 +77,26 @@ static int marlin_sdio_rx_cb(int chn, struct mbuf_t *head, struct mbuf_t *tail, 
 {
     int block_size;
 
+    if (head->len < BT_SDIO_HEAD_LEN)
+    {
+        pr_err("%s short rx buffer (%d)\n", __func__, head->len);
+        sprdwcn_bus_push_list(chn, head, tail, num);
+        return -EINVAL;
+    }
+
     block_size = ((head->buf[2] & 0x7F) << 9) + (head->buf[1] << 1) + (head->buf[0] >> 7);
+    /* never hand more than the received buffer to the tty */
+    if (block_size > head->len - BT_SDIO_HEAD_LEN)
+    {
+        pr_err("%s bad block size %d (len %d)\n", __func__, block_size, head->len);
+        block_size = head->len - BT_SDIO_HEAD_LEN;
+    }
     BT_VER("%s +++\n", __func__);
 
     if (bt_data_if_cb == NULL)
     {
+        /* give the buffers back, or the rx pool runs dry */
+        sprdwcn_bus_push_list(chn, head, tail, num);
         return -1;
     }
 
@@ -103,6 +118,11 @@ int marlin_sdio_write(const unsigned char *buf, int count)
     const unsigned char *tmp_buf = buf + 1;
     unsigned short op = 0;
     int i = 0;
+
+    if (count < 3)
+    {
+        return -EINVAL;
+    }
 
     STREAM_TO_UINT16(op, tmp_buf);
 
@@ -130,6 +150,7 @@ int marlin_sdio_write(const unsigned char *buf, int count)
     {
         pr_err("%s sprdwcn_bus_list_alloc failed: %d\n", __func__, ret);
         up(&sem_id);
+        kfree(block);
         return -ENOMEM;
     }
 
@@ -156,6 +177,8 @@ int marlin_sdio_write(const unsigned char *buf, int count)
         kfree(tx_head->buf);
         tx_head->buf = NULL;
         sprdwcn_bus_list_free(BT_TX_CHANNEL, tx_head, tx_tail, num);
+        /* marlin_sdio_tx_cb() will not run for this buffer */
+        up(&sem_id);
         return -EBUSY;
     }
 
@@ -207,7 +230,8 @@ static int bt_tx_powerchange(int channel, int is_resume)
                 payload[2] = 0x01;
                 payload[3] = 0x00;
                 hci_set_ap_sleep_mode(WOBLE_IS_NOT_SHUTDOWN, WOBLE_IS_RESUME);
-                bt_data_if_cb->recv(payload, block_size);
+                if (bt_data_if_cb)
+                    bt_data_if_cb->recv(payload, block_size);
             }
         }
         /*
@@ -255,6 +279,9 @@ int marlin_sdio_init(struct bt_data_interface_cb_t *cb)
 {
     int ret = 0;
     pr_err("%s\n", __func__);
+    /* rx can start as soon as the channel is registered */
+    bt_data_if_cb = cb;
+    sema_init(&sem_id, BT_TX_POOL_SIZE - 1);
     ret = sprdwcn_bus_chn_init(&bt_rx_ops);
 
     if (ret)
@@ -269,8 +296,6 @@ int marlin_sdio_init(struct bt_data_interface_cb_t *cb)
         pr_err("%s sprdwcn_bus_chn_init err chn %d\n", __func__, bt_tx_ops.channel);
     }
 
-    bt_data_if_cb = cb;
-    sema_init(&sem_id, BT_TX_POOL_SIZE - 1);
     return 0;
 }
 

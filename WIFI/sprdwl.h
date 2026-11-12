@@ -82,7 +82,11 @@ struct sprdwl_suspend_resume_connect {
 	struct cfg80211_connect_params connect_params;
 	struct ieee80211_channel channel;
 	struct ieee80211_channel channel_hint;
-	u8 ie[100];
+	/*
+	 * Must hold any connect IE set nl80211 accepts (assoc request IEs
+	 * from wpa_supplicant are routinely longer than 100 bytes).
+	 */
+	u8 ie[IEEE80211_MAX_DATA_LEN];
 	u8 key[WLAN_MAX_KEY_LEN];
 	u8 bssid[ETH_ALEN];
 	u8 bssid_hint[ETH_ALEN];
@@ -141,8 +145,10 @@ struct sprdwl_vif {
 	u8 prwise_crypto;
 	u8 grp_crypto;
 	u8 key_index[2];
-	u8 key[2][4][WLAN_MAX_KEY_LEN];
-	u8 key_len[2][4];
+	/* key indexes 0-3 (PTK/GTK/WEP) and 4-5 (IGTK, 802.11w) */
+#define SPRDWL_NUM_KEY_SLOTS	6
+	u8 key[2][SPRDWL_NUM_KEY_SLOTS][WLAN_MAX_KEY_LEN];
+	u8 key_len[2][SPRDWL_NUM_KEY_SLOTS];
 	unsigned long mgmt_reg;
 
 	/* P2P stuff */
@@ -421,6 +427,7 @@ void clean_scan_list(struct sprdwl_vif *vif);
 extern struct sprdwl_priv *g_sprdwl_priv;
 
 void sprdwl_netif_rx(struct sk_buff *skb, struct net_device *ndev);
+bool sprdwl_is_sprdwl_netdev(const struct net_device *ndev);
 void sprdwl_stop_net(struct sprdwl_vif *vif);
 void sprdwl_net_flowcontrl(struct sprdwl_priv *priv,
 			   enum sprdwl_mode mode, bool state);

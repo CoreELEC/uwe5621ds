@@ -45,12 +45,21 @@ int ipv6_csum(void *data, __wsum csum)
 	struct ethhdr *eth = (struct ethhdr *)(data + msdu_desc->msdu_offset);
 	struct ipv6hdr *ip6h = NULL;
 	struct ipv6_opt_hdr *hp = NULL;
-	unsigned short dataoff = ETH_HLEN;
+	unsigned int dataoff = ETH_HLEN;
 	unsigned short nexthdr = 0;
 
 	wl_debug("%s: eth_type: 0x%x\n", __func__, eth->h_proto);
 
 	if (eth->h_proto == cpu_to_be16(ETH_P_IPV6)) {
+		/*
+		 * The extension header chain comes from the network: bound
+		 * every step by the MSDU length, otherwise a packet with a
+		 * long (or bogus) chain makes us read past the buffer.
+		 * Such a packet is malformed: report a checksum error so
+		 * the caller drops it.
+		 */
+		if (msdu_desc->msdu_len < dataoff + sizeof(*ip6h))
+			return -1;
 		data += msdu_desc->msdu_offset;
 		ip6h = data + dataoff;
 		nexthdr = ip6h->nexthdr;
@@ -58,8 +67,12 @@ int ipv6_csum(void *data, __wsum csum)
 
 		while (mh_ipv6_ext_hdr(nexthdr))  {
 			wl_debug("%s: nexthdr: %d\n", __func__, nexthdr);
+			if (msdu_desc->msdu_len < dataoff + sizeof(*hp))
+				return -1;
 			hp = (struct ipv6_opt_hdr *)(data + dataoff);
 			dataoff += ipv6_optlen(hp);
+			if (dataoff > msdu_desc->msdu_len)
+				return -1;
 			nexthdr = hp->nexthdr;
 		}
 
@@ -168,8 +181,17 @@ void sprdwl_rx_process(struct sprdwl_rx_if *rx_if, struct sk_buff *pskb)
 
 	if (!skb_queue_empty(&rx_if->net_rx_list)) {
 #if defined RX_NAPI
-		if (rx_if->napi_rx_enable)
+		/*
+		 * Called from the RX kthread: raising NET_RX_SOFTIRQ from
+		 * process context only marks it pending, so the poll would
+		 * wait for the next interrupt/bh enable on this CPU. Run it
+		 * right away when re-enabling bottom halves.
+		 */
+		if (rx_if->napi_rx_enable) {
+			local_bh_disable();
 			napi_schedule(&rx_if->napi_rx);
+			local_bh_enable();
+		}
 #elif defined SPLIT_STACK
 		if (!work_pending(&rx_if->rx_net_work))
 			queue_work(rx_if->rx_net_workq, &rx_if->rx_net_work);
@@ -446,10 +468,18 @@ int sprdwl_pkt_log_save(struct sprdwl_intf *intf, void *data)
 	 * get_fs()/set_fs(KERNEL_DS) override this used to need was
 	 * removed along with set_fs() in Linux 5.10.
 	 */
-	pkt_len = ((struct sprdwl_pktlog_hdr *)(data))->plen;
+	/* plen includes the header itself, which is skipped below */
+	pkt_len = le16_to_cpu(((struct sprdwl_pktlog_hdr *)(data))->plen);
+	if (pkt_len < (int)sizeof(struct sprdwl_pktlog_hdr))
+		pkt_len = 0;
+	else
+		pkt_len -= sizeof(struct sprdwl_pktlog_hdr);
 	data += sizeof(struct sprdwl_pktlog_hdr);
-	while (m < pkt_len) {
+	while (m + 4 <= pkt_len) {
 		data_len = *((unsigned char *)(data + 2)) + 4;
+		/* never dump beyond the packet log payload */
+		if (data_len > pkt_len - m)
+			data_len = pkt_len - m;
 		m += data_len;
 		temp_space = ' ';
 		temp_enter = '\n';
